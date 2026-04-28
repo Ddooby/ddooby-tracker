@@ -1,5 +1,17 @@
 # Ddooby-tracker
 
+## 🚦 CURRENT STATUS
+
+초기 구현 완료. 새 환경에서 아래 순서로 실행:
+
+```bash
+cd ddooby-tracker
+npm install
+npx expo run:android
+```
+
+> Android 기기(USB 연결) 또는 에뮬레이터(Android Studio AVD) 필요
+
 GPS 기반 산책 경로 기록 앱 (React Native + Expo)
 
 ## 초기 설정
