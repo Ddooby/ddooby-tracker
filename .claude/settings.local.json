@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(adb devices *)",
+      "Read(//Users/ddooby/Library/Android/sdk/platform-tools/**)",
+      "Bash(~/Library/Android/sdk/platform-tools/adb devices *)",
+      "Bash(git *)"
+    ]
+  }
+}
