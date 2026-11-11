@@ -45,3 +45,6 @@ yarn-error.*
 
 # local agent state
 .omc/
+
+# Codex 탭 결과 (docs/WORKFLOW.md)
+.codex-out/
