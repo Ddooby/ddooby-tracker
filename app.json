@@ -30,7 +30,7 @@
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION"
       ],
-      "package": "com.anonymous.ddoobytrackernew"
+      "package": "com.ddooby.tracker"
     },
     "web": {
       "favicon": "./assets/favicon.png"
