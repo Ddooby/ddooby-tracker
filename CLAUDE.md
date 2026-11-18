@@ -78,9 +78,12 @@ ddooby-tracker/
 기존 React Native + Expo 구조를 우선한다. `hooks/useLocation.js`, `screens/HomeScreen.js`, `utils/distance.js`, `storage/walkStorage.js`와 Android 설정을 작업 전에 확인한다.
 
 ### GPS 추적
-- `watchPositionAsync` 로 실시간 추적. 현행 값: `Location.Accuracy.BestForNavigation`, `timeInterval: 2000`, `distanceInterval: 5`
-- 컴포넌트 언마운트·산책 종료 시 반드시 `subscription.remove()` 호출 (메모리 누수 방지)
-- 위치 샘플의 타임스탬프/정확도를 보존한다 (SPEC TR-F03). 현행 코드는 `latitude`, `longitude`만 저장하며 TRK-01에서 반영한다.
+- 산책 중 위치는 `expo-task-manager` task + `Location.startLocationUpdatesAsync` **포그라운드 서비스(상시 알림)** 로 수집한다. 값: `Location.Accuracy.BestForNavigation`, `timeInterval: 2000`, `distanceInterval: 5` (2026-11-18 사용자 승인, TRK-01. 현행 코드는 `watchPositionAsync`이며 TRK-01에서 교체한다.)
+- 권한은 "앱 사용 중 허용"(foreground)만 요청한다. `ACCESS_BACKGROUND_LOCATION`("항상 허용")은 요청·선언하지 않는다. 포그라운드 서비스는 앱이 화면에 있을 때(산책 시작 버튼)만 시작한다.
+- task는 `TaskManager.defineTask`로 앱 진입점 최상위에서 등록한다. 컴포넌트 안에서 정의하지 않는다.
+- 산책 종료 시 반드시 `stopLocationUpdatesAsync` 호출, 컴포넌트 언마운트 시 위치 리스너·구독의 `remove()` 호출 (메모리 누수·배터리 소모 방지). 언마운트만으로 진행 중인 산책 수집을 멈추지는 않는다.
+- 진행 중 산책은 임시 키 `@active_walk`에 저장해 앱 프로세스가 종료돼도 이어 붙인다. 종료(저장/버리기) 시 삭제한다. `@walks_history`와 별개다.
+- 위치 샘플의 타임스탬프/정확도를 보존한다 (SPEC TR-F03).
 - 화면 잠금 중 추적은 Android 실기기에서 검증 전까지 구현 완료로 표시하지 않는다.
 
 ### 시간
@@ -116,7 +119,8 @@ ddooby-tracker/
 
 - `utils/distance.js` 의 Haversine 로직을 외부 라이브러리로 교체하지 말 것
 - AsyncStorage key `@walks_history` 임의 변경 금지
-- `locationSubscription.remove()` 클린업 누락 금지
+- 산책 종료 시 `stopLocationUpdatesAsync`, 언마운트 시 리스너·구독 `remove()` 클린업 누락 금지
+- 백그라운드 위치 권한(`ACCESS_BACKGROUND_LOCATION`) 요청·선언 금지 (사용자 별도 승인 전)
 - 좌표 샘플에는 `latitude`, `longitude`, `timestamp`, `accuracy`만 저장한다. `altitude`, `speed` 등 불필요한 필드 포함 금지 (저장 용량 절약)
 
 ## 8. 명령과 Git

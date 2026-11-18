@@ -33,9 +33,14 @@ screens/HomeScreen.js (UI, 이벤트)
 
 ### 3.1 TRK-01 — 잠금 상태 위치 기록
 
-- 대상 후보: `hooks/useLocation.js`, `app.json` 및 Expo task 등록 관련 파일(실제 구조 확인 후 지정).
-- Android 앱이 foreground/background/화면 잠금/종료 상태에서 각각 어떤 수준의 수집을 보장하는지 구분한다.
-- 백그라운드 location task, 필요한 권한·고지, 앱 복귀·중복 구독·종료 후 정리를 검토한다. **OS 정책과 Expo 버전별 제한은 구현 전에 확인**한다.
+- 대상: `package.json`(`expo-task-manager`), `app.json`(expo-location 플러그인·앱 이름), `tasks/locationTask.js`(신규), `index.js`, `hooks/useLocation.js`, `screens/HomeScreen.js`.
+- **결정 (2026-11-18, 사용자 승인)**: Android 포그라운드 서비스 방식. `startLocationUpdatesAsync(task, { foregroundService })`는 알림이 있는 사용자 시작 서비스이면 `ACCESS_BACKGROUND_LOCATION` 없이 동작한다 (근거: `node_modules/expo-location/android/.../LocationModule.kt:252-255`, expo-location 19.0.8). 플러그인 `isAndroidForegroundServiceEnabled: true`, `isAndroidBackgroundLocationEnabled: false`.
+- 데이터 흐름: task 콜백 → 샘플 `{latitude, longitude, timestamp, accuracy}`를 `@active_walk`에 추가 저장 + 앱이 떠 있으면 화면에 전달 → 종료 시 `stopLocationUpdatesAsync` 후 기존 `saveWalk`로 `@walks_history` 저장, `@active_walk` 삭제.
+- 앱 재실행 시 `hasStartedLocationUpdatesAsync`와 `@active_walk`로 진행 중 산책을 복원한다. 중복 시작을 막는다.
+- 권한 거부: 다시 요청 가능하면 재요청, `canAskAgain === false`면 설정 열기(`Linking.openSettings`)를 안내한다.
+- 알림 문구: 제목 "산책 기록 중", 내용 "화면이 꺼져도 경로를 기록합니다".
+- 범위 밖(TRK-02): 시작·종료 시각 기반 시간, 정지 판정, 거리 이상치, 저장 스키마 버전. `utils/distance.js` 변경 없음.
+- 검증: 자동 테스트 스크립트 없음(미구축). 실기기 시나리오 — 잠금 3~5분 보행, 앱 전환 후 복귀, 권한 거부→재시도/설정, 종료 후 알림·`dumpsys location` 요청 해제, 저장 좌표 `timestamp`/`accuracy`, 프로세스 강제 종료 후 복원.
 - 좌표마다 측정 시각·정확도 포함. 수집 간격/거리 조건은 성능과 배터리 소비를 실측해 조정한다.
 - 부작용: 배터리·권한 UX·스토어 정책. 상용 서비스의 상시 추적 기능으로 확대하지 않는다.
 
@@ -80,6 +85,6 @@ screens/HomeScreen.js (UI, 이벤트)
 
 ## 6. 미확정 설계 항목
 
-- Android에서 잠금 중 기록을 보장할 구체적인 task/서비스 방식, 필요한 OS 권한 및 빌드 설정.
+- ~~Android 잠금 중 기록 방식~~ → 3.1에서 포그라운드 서비스로 결정 (2026-11-18). 남은 확인: Samsung 배터리 최적화가 서비스를 종료하는지 실기기 확인.
 - 이동/정지/수집 공백/정확도 필터의 수치 기준과 표시 UX.
 - 과거 기록 스키마 및 저장 키 확인 후 마이그레이션 방식.

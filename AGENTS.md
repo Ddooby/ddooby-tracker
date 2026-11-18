@@ -42,6 +42,7 @@
 ## 5. Tracker 우선 검토 위험
 
 - 화면 잠금 동안 실제 GPS 수집, 위치 권한 거부/재시도, 종료 뒤 구독 정리.
+  - 확정 방식(2026-11-18, TRK-01): `expo-task-manager` task + `startLocationUpdatesAsync` 포그라운드 서비스(상시 알림), foreground 권한만 사용, `ACCESS_BACKGROUND_LOCATION` 금지, 진행 중 산책은 임시 키 `@active_walk`(종료 시 삭제), `@walks_history` 키 변경 금지. 세부 규칙은 `CLAUDE.md` 6·7절.
 - 측정 시각 원천 및 총시간/이동시간 분리, 정지 중 GPS 튐·결측 처리.
 - 거리 계산·기존 이력 저장 형식 호환, 위치 개인 정보 유출 위험.
 - `SPEC.md` 6절 전환 기준을 6회 **실기기 증거**와 직접 대조.
