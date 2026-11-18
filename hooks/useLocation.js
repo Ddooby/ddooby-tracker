@@ -8,7 +8,9 @@ import {
   clearActiveWalk,
   whenActiveWalkIdle,
   subscribeActiveWalk,
+  cleanupOrphanSamples,
   mergeSamples,
+  newWalkId,
   toSample,
 } from '../storage/activeWalk';
 
@@ -47,8 +49,8 @@ async function hasForegroundPermission() {
   }
 }
 
-// task를 멈추고 실제로 멈췄는지 확인한다. stop 예외나 "아직 실행 중"이면 최대 3초 재확인 후
-// 한 번 더 stop. 두 번 모두 실패하면 throw. (권한 회수 뒤 stop이 실패하는 사례 대비)
+// task를 멈추고 실제로 멈췄는지 확인한다. 등록이 해제됐으면(hasStarted=false) stop 예외가 있었어도
+// 성공으로 본다(예외는 경고만). 아직 실행 중이면 최대 3초 재확인 후 한 번 더 stop, 두 번 모두 실패하면 throw.
 async function stopAndVerify() {
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -60,18 +62,25 @@ async function stopAndVerify() {
     }
     const deadline = Date.now() + 3000;
     let running = true;
+    let checkError = null;
     for (;;) {
       try {
         running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+        checkError = null;
       } catch (e) {
-        stopError = stopError ?? e;
+        checkError = e;
         running = true;
       }
       if (!running || Date.now() >= deadline) break;
       await sleep(500);
     }
-    if (!running && !stopError) return;
-    lastError = stopError ?? new Error('위치 수집이 중단되지 않았습니다.');
+    if (!running) {
+      if (stopError) {
+        console.warn('[useLocation] stop threw but task is unregistered', stopError?.message ?? stopError);
+      }
+      return;
+    }
+    lastError = stopError ?? checkError ?? new Error('위치 수집이 중단되지 않았습니다.');
   }
   throw lastError;
 }
@@ -143,6 +152,12 @@ export default function useLocation() {
 
     runExclusive(async () => {
       try {
+        // 메타가 없거나 id가 다른 샘플 키(늦은 쓰기로 남은 고아)를 먼저 지운다.
+        try {
+          await cleanupOrphanSamples();
+        } catch (e) {
+          console.warn('[useLocation] orphan cleanup failed', e?.message ?? e);
+        }
         const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
         const walk = await getActiveWalk();
         if (!mountedRef.current) return;
@@ -212,9 +227,8 @@ export default function useLocation() {
             accuracy: Location.Accuracy.BestForNavigation,
           });
           const firstSample = toSample(initial);
-          // 첫 샘플이 startedAt 이전으로 걸러지지 않도록 시작 시각을 맞춘다
-          const startedAtMs = Math.min(Date.now(), firstSample.timestamp);
-          const walk = { id: String(startedAtMs), startedAt: startedAtMs };
+          // id는 위치 timestamp와 분리된 고유값, 첫 샘플은 별도 키라 startedAt 필터에서 제외된다
+          const walk = { id: newWalkId(), startedAt: Date.now() };
           await startActiveWalk(walk, [firstSample]);
           applyWalk({ ...walk, coords: [firstSample] });
           try {

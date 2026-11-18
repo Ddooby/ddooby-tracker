@@ -2,15 +2,16 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // 진행 중 산책 임시 저장소. '@walks_history'와 별개이며 저장/버리기 확정 시 삭제한다.
 //
-// 구조 (TRK-01 재리뷰: 헤드리스 task와 UI가 같은 키를 읽고-수정-쓰지 않도록 분리)
-//   '@active_walk'                          메타만: { id: String(startedAt), startedAt }
-//   '@active_walk_samples:<id>:<첫 ts>'     task 콜백 한 배치의 샘플 배열 (쓰기 전용, 덮어쓰지 않음)
-// 이전 빌드는 '@active_walk'에 coords(또는 samples) 배열을 함께 저장했다. 읽을 때 병합한다.
+// 구조 (헤드리스 task와 UI가 같은 키를 읽고-수정-쓰지 않도록 분리)
+//   '@active_walk'                                   메타만: { id, startedAt }
+//   '@active_walk_samples:<id>:<첫 ts>:<배치 id>'    task 콜백 한 배치의 샘플 배열 (쓰기 전용)
+//   '@active_walk_samples:<id>:<첫 ts>:init'         시작 시 첫 샘플 (별도 키, startedAt 필터 제외)
+// 산책 id는 위치 timestamp와 무관한 고유값(newWalkId), 배치 id는 TaskManager eventId(없으면 무작위)라서
+// 같은 첫 timestamp의 배치끼리도 키가 겹치지 않는다.
+// 이전 빌드는 '@active_walk'에 coords(또는 samples) 배열을 함께 저장했다. 읽을 때 필터 없이 병합한다.
 //
-// 한계: 배치 키는 배치의 첫 timestamp로 구분한다. 콜백마다 timestamp가 달라 키가 겹치지 않고,
-// 겹쳐도 같은 샘플이라 병합 시 timestamp 중복 제거로 흡수된다. 메타를 지운 직후 도착한 배치는
-// 메타가 없거나 id가 달라 무시되고, 남은 고아 키는 다음 산책 시작 때 지운다.
-// 아래 queue는 한 JS 컨텍스트 안의 순서만 맞춘다 (컨텍스트 간 원자성은 위 구조로 대신한다).
+// 한계: 컨텍스트 간 원자성은 없다. 종료(메타 삭제) 직후 헤드리스 콜백이 키를 쓰면 쓰기 후 재확인으로
+// 지우지만 그 사이 틈은 남을 수 있고, 남은 고아 키는 앱 시작 복원·새 산책 시작 때 지운다.
 const META_KEY = '@active_walk';
 const SAMPLES_PREFIX = '@active_walk_samples:';
 
@@ -24,6 +25,13 @@ function enqueue(job) {
 }
 
 const samplePrefixFor = (id) => `${SAMPLES_PREFIX}${id}:`;
+const randomPart = () => Math.random().toString(36).slice(2, 8);
+const INIT_BATCH = 'init';
+
+// 위치 timestamp와 분리된 고유 산책 id (':' 없음)
+export function newWalkId() {
+  return `${Date.now()}-${randomPart()}`;
+}
 
 export function toSample(location) {
   return {
@@ -86,17 +94,20 @@ export function getActiveWalk() {
     if (!meta) return null;
     const keys = await keysWithPrefix(samplePrefixFor(meta.id));
     const pairs = keys.length ? await AsyncStorage.multiGet(keys) : [];
-    const lists = [meta.coords, meta.samples];
-    for (const [, value] of pairs) {
+    const batches = [];
+    for (const [key, value] of pairs) {
       if (!value) continue;
       try {
         const batch = JSON.parse(value);
-        if (Array.isArray(batch)) lists.push(batch);
+        if (!Array.isArray(batch)) continue;
+        // startedAt 이전 샘플은 task 배치에서만 버린다 (시작 시 첫 샘플은 유지)
+        batches.push(key.endsWith(`:${INIT_BATCH}`) ? batch : batch.filter((s) => s.timestamp >= meta.startedAt));
       } catch {
         // 깨진 배치는 건너뛴다
       }
     }
-    const coords = mergeSamples(...lists).filter((s) => s.timestamp >= meta.startedAt);
+    // 이전 형식 배열(coords/samples)은 필터 없이 그대로 병합한다.
+    const coords = mergeSamples(meta.coords, meta.samples, ...batches);
     return { id: meta.id, startedAt: meta.startedAt, coords };
   });
 }
@@ -111,7 +122,7 @@ export function startActiveWalk({ id, startedAt }, initialSamples = []) {
     const pairs = [[META_KEY, JSON.stringify({ id, startedAt })]];
     if (initialSamples.length) {
       pairs.push([
-        `${samplePrefixFor(id)}${initialSamples[0].timestamp}`,
+        `${samplePrefixFor(id)}${initialSamples[0].timestamp}:${INIT_BATCH}`,
         JSON.stringify(initialSamples),
       ]);
     }
@@ -120,18 +131,32 @@ export function startActiveWalk({ id, startedAt }, initialSamples = []) {
 }
 
 // task 콜백용: 메타만 읽고 배치 키에 쓰기만 한다 (공유 키 읽기-수정-쓰기 없음).
-export function appendActiveSamples(samples) {
+// 쓴 뒤 메타를 다시 읽어 산책이 끝났거나 id가 달라졌으면 방금 쓴 키를 지운다 (늦은 쓰기 완화).
+export function appendActiveSamples(samples, batchId) {
   return enqueue(async () => {
     const meta = await readMeta();
     if (!meta) return null; // 진행 중 산책이 없으면 늦게 온 콜백은 버린다.
     const fresh = samples.filter((s) => s.timestamp >= meta.startedAt);
     if (fresh.length === 0) return meta;
-    await AsyncStorage.setItem(
-      `${samplePrefixFor(meta.id)}${fresh[0].timestamp}`,
-      JSON.stringify(fresh)
-    );
+    const key = `${samplePrefixFor(meta.id)}${fresh[0].timestamp}:${batchId ?? randomPart()}`;
+    await AsyncStorage.setItem(key, JSON.stringify(fresh));
+    const after = await readMeta();
+    if (!after || after.id !== meta.id) {
+      await AsyncStorage.removeItem(key);
+      return null;
+    }
     notify({ id: meta.id, samples: fresh });
     return meta;
+  });
+}
+
+// 메타가 없거나 id가 다른 샘플 키(고아)를 지운다. 앱 시작 복원 때 호출한다.
+export function cleanupOrphanSamples() {
+  return enqueue(async () => {
+    const meta = await readMeta();
+    const keys = await keysWithPrefix(SAMPLES_PREFIX);
+    const orphans = meta ? keys.filter((k) => !k.startsWith(samplePrefixFor(meta.id))) : keys;
+    if (orphans.length) await AsyncStorage.multiRemove(orphans);
   });
 }
 
