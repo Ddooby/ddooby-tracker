@@ -160,23 +160,29 @@ export function cleanupOrphanSamples() {
   });
 }
 
-// 메타와 그 산책의 샘플 키를 모두 지운다. expectedId가 있고 다른 산책의 메타면 지우지 않는다.
-// 삭제 오류와, 지운 뒤에도 키가 남은 경우는 throw (호출자가 성공으로 취급하지 않게).
+// 메타를 먼저 지운 뒤 그 산책의 샘플 키를 조회·삭제하고 재조회로 확인한다 (expectedId가 다른 산책의
+// 메타면 지우지 않는다). task는 쓰기 직후 메타를 다시 읽으므로, 메타 삭제 뒤 목록 조회 전에 쓴 키는
+// 목록에 잡혀 지워지고, 조회 뒤에 쓴 키는 task가 메타 없음을 보고 스스로 지운다. task 프로세스가
+// 쓰기와 재확인 사이에 죽으면 다음 실행의 cleanupOrphanSamples가 정리한다. 종료 순간 진행 중이던
+// 배치의 샘플은 저장 기록에서 빠질 수 있다(사용자 수용, 2026-11-19).
+// 삭제 오류와 지운 뒤에도 키가 남은 경우는 throw (호출자가 성공으로 취급하지 않게).
 export function clearActiveWalk(expectedId) {
   return enqueue(async () => {
     const meta = await readMeta();
     if (expectedId !== undefined && meta && meta.id !== expectedId) return;
     const id = meta ? meta.id : expectedId;
-    const keys = await AsyncStorage.getAllKeys();
-    const targets = keys.filter(
-      (k) => k === META_KEY || (id !== undefined && k.startsWith(samplePrefixFor(id)))
-    );
-    if (targets.length === 0) return;
-    await AsyncStorage.multiRemove(targets);
-    const left = new Set(await AsyncStorage.getAllKeys());
-    if (targets.some((k) => left.has(k))) {
-      throw new Error('임시 기록을 지우지 못했습니다.');
+
+    await AsyncStorage.removeItem(META_KEY);
+    if (await readMeta()) throw new Error('임시 기록을 지우지 못했습니다.');
+    if (id === undefined) return;
+
+    const prefix = samplePrefixFor(id);
+    let left = await keysWithPrefix(prefix);
+    for (let attempt = 0; attempt < 2 && left.length > 0; attempt += 1) {
+      await AsyncStorage.multiRemove(left);
+      left = await keysWithPrefix(prefix); // 재조회로 남은 키 확인
     }
+    if (left.length > 0) throw new Error('임시 기록을 지우지 못했습니다.');
   });
 }
 
