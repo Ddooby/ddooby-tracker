@@ -8,6 +8,7 @@ import {
   clearActiveWalk,
   whenActiveWalkIdle,
   subscribeActiveWalk,
+  mergeSamples,
   toSample,
 } from '../storage/activeWalk';
 
@@ -20,6 +21,8 @@ const TASK_OPTIONS = {
     notificationBody: '화면이 꺼져도 경로를 기록합니다',
   },
 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Android 13+ 에서만 알림 권한이 필요하다. 거부돼도 위치 수집은 계속한다(알림은 표시용).
 async function ensureNotificationPermission() {
@@ -35,10 +38,60 @@ async function ensureNotificationPermission() {
   }
 }
 
+async function hasForegroundPermission() {
+  try {
+    const perm = await Location.getForegroundPermissionsAsync();
+    return perm.status === 'granted';
+  } catch {
+    return false;
+  }
+}
+
+// task를 멈추고 실제로 멈췄는지 확인한다. stop 예외나 "아직 실행 중"이면 최대 3초 재확인 후
+// 한 번 더 stop. 두 번 모두 실패하면 throw. (권한 회수 뒤 stop이 실패하는 사례 대비)
 async function stopAndVerify() {
-  await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
-  if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME)) {
-    throw new Error('위치 수집이 중단되지 않았습니다.');
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let stopError = null;
+    try {
+      await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+    } catch (e) {
+      stopError = e;
+    }
+    const deadline = Date.now() + 3000;
+    let running = true;
+    for (;;) {
+      try {
+        running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+      } catch (e) {
+        stopError = stopError ?? e;
+        running = true;
+      }
+      if (!running || Date.now() >= deadline) break;
+      await sleep(500);
+    }
+    if (!running && !stopError) return;
+    lastError = stopError ?? new Error('위치 수집이 중단되지 않았습니다.');
+  }
+  throw lastError;
+}
+
+// 포그라운드 서비스(알림)를 새로 띄운다: 기존 task 정리(실패 무시) 후 같은 옵션으로 재시작.
+async function restartService() {
+  try {
+    await stopAndVerify();
+  } catch (e) {
+    console.warn('[useLocation] stop before restart failed', e?.message ?? e);
+  }
+  await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, TASK_OPTIONS);
+}
+
+// 서비스 정리(실패해도 진행). 정리 결과는 경고 로그로만 남긴다.
+async function cleanupService() {
+  try {
+    await stopAndVerify();
+  } catch (e) {
+    console.warn('[useLocation] service cleanup failed', e?.message ?? e);
   }
 }
 
@@ -49,16 +102,17 @@ async function stopAndVerify() {
 //   { ok: false, reason: 'error', message }
 // stopTracking 반환:
 //   { ok: true, walk }  // walk: { id, startedAt, coords } | null
-//   { ok: false, reason: 'stop-failed', message }
+//   { ok: false, reason: 'stop-failed' | 'read-failed', message }
 export default function useLocation() {
   const [currentLocation, setCurrentLocation] = useState(null);
   const [coords, setCoords] = useState([]);
   const [isTracking, setIsTracking] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
   const [restoring, setRestoring] = useState(true);
-  // task 없이 '@active_walk'만 남은 경우(서비스가 중단됨): 화면이 저장/버리기를 묻도록 노출
+  // 수집 중이 아닌데 기록이 남은 경우(서비스 중단·권한 회수): 화면이 저장/버리기를 묻도록 노출
   const [interruptedWalk, setInterruptedWalk] = useState(null);
   const mountedRef = useRef(true);
+  const walkIdRef = useRef(null);
   const opChainRef = useRef(Promise.resolve());
 
   // 시작·복원·종료를 한 번에 하나씩만 실행한다.
@@ -70,30 +124,50 @@ export default function useLocation() {
 
   const applyWalk = useCallback((walk) => {
     if (!mountedRef.current || !walk) return;
+    walkIdRef.current = walk.id;
     setCoords(walk.coords);
     setStartedAt(walk.startedAt);
     const last = walk.coords[walk.coords.length - 1];
     if (last) setCurrentLocation({ latitude: last.latitude, longitude: last.longitude });
   }, []);
 
-  // 마운트: task가 돌고 있으면 진행 중 산책 복원, 구독 해제는 언마운트 시
+  // 마운트: 기록이 있으면 복원, 구독 해제는 언마운트 시
   useEffect(() => {
     mountedRef.current = true;
-    const unsubscribe = subscribeActiveWalk(applyWalk);
+    const unsubscribe = subscribeActiveWalk(({ id, samples }) => {
+      if (!mountedRef.current || walkIdRef.current !== id) return;
+      setCoords((prev) => mergeSamples(prev, samples));
+      const last = samples[samples.length - 1];
+      if (last) setCurrentLocation({ latitude: last.latitude, longitude: last.longitude });
+    });
 
     runExclusive(async () => {
       try {
         const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
         const walk = await getActiveWalk();
         if (!mountedRef.current) return;
-        if (running && walk) {
-          applyWalk(walk);
-          setIsTracking(true);
-        } else if (!running && walk) {
+        if (walk && running) {
+          if (await hasForegroundPermission()) {
+            // 프로세스가 죽었다 복원되면 포그라운드 서비스(알림)가 없으므로 다시 띄운다.
+            try {
+              applyWalk(walk);
+              await restartService();
+              setIsTracking(true);
+            } catch (e) {
+              console.warn('[useLocation] restart failed', e?.message ?? e);
+              await cleanupService();
+              setInterruptedWalk(walk);
+            }
+          } else {
+            // 권한이 회수됨: 수집 중으로 표시하지 않고 서비스 정리 후 저장/버리기로 보낸다.
+            await cleanupService();
+            setInterruptedWalk(walk);
+          }
+        } else if (walk && !running) {
           setInterruptedWalk(walk);
-        } else if (running && !walk) {
-          // 데이터 없이 서비스만 남은 고아 상태 → 정리
-          await stopAndVerify();
+        } else if (running) {
+          // 기록 없이 서비스만 남은 고아 상태 → 정리
+          await cleanupService();
         }
       } catch (e) {
         console.warn('[useLocation] restore failed', e?.message ?? e);
@@ -120,29 +194,29 @@ export default function useLocation() {
           const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
           const existing = await getActiveWalk();
           if (running && existing) {
-            // 이미 진행 중 → 중복 시작하지 않고 이어 붙인다
+            // 이미 진행 중 → 새로 시작하지 않고 서비스만 다시 띄워 이어 붙인다
             applyWalk(existing);
+            await restartService();
             setIsTracking(true);
             return { ok: true, notificationsBlocked: false };
           }
-          if (!running && existing) {
+          if (existing) {
             // 이전 기록이 남아 있으면 덮어쓰지 않고 저장/버리기를 먼저 처리하게 한다
             return { ok: false, reason: 'pending-walk', walk: existing };
           }
-          if (running && !existing) await stopAndVerify();
+          if (running) await stopAndVerify();
 
           const notificationsGranted = await ensureNotificationPermission();
 
           const initial = await Location.getCurrentPositionAsync({
             accuracy: Location.Accuracy.BestForNavigation,
           });
-          const startedAtMs = Date.now();
-          const walk = {
-            id: String(startedAtMs),
-            startedAt: startedAtMs,
-            coords: [toSample(initial)],
-          };
-          await startActiveWalk(walk);
+          const firstSample = toSample(initial);
+          // 첫 샘플이 startedAt 이전으로 걸러지지 않도록 시작 시각을 맞춘다
+          const startedAtMs = Math.min(Date.now(), firstSample.timestamp);
+          const walk = { id: String(startedAtMs), startedAt: startedAtMs };
+          await startActiveWalk(walk, [firstSample]);
+          applyWalk({ ...walk, coords: [firstSample] });
           try {
             await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, TASK_OPTIONS);
           } catch (e) {
@@ -159,7 +233,8 @@ export default function useLocation() {
     [applyWalk, runExclusive]
   );
 
-  // 수집 중단을 확인한 뒤에만 성공을 반환한다. 실패하면 isTracking과 '@active_walk'를 유지한다.
+  // 수집 중단을 확인한 뒤 임시 기록을 읽어 반환한다. 어느 단계든 실패하면 isTracking과 임시 기록을
+  // 그대로 두고 실패를 반환한다. 재시도할 때 서비스가 이미 멈춰 있으면 중단은 건너뛰고 기록만 읽는다.
   const stopTracking = useCallback(
     () =>
       runExclusive(async () => {
@@ -170,15 +245,20 @@ export default function useLocation() {
         } catch (e) {
           return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) };
         }
-        await whenActiveWalkIdle();
-        const walk = await getActiveWalk();
-        if (mountedRef.current) setIsTracking(false);
-        return { ok: true, walk };
+        try {
+          await whenActiveWalkIdle();
+          const walk = await getActiveWalk();
+          if (mountedRef.current) setIsTracking(false);
+          return { ok: true, walk };
+        } catch (e) {
+          return { ok: false, reason: 'read-failed', message: e?.message ?? String(e) };
+        }
       }),
     [runExclusive]
   );
 
   const resetTracking = useCallback(() => {
+    walkIdRef.current = null;
     setCoords([]);
     setCurrentLocation(null);
     setStartedAt(null);

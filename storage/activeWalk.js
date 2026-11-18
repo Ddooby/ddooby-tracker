@@ -1,15 +1,19 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // 진행 중 산책 임시 저장소. '@walks_history'와 별개이며 저장/버리기 확정 시 삭제한다.
-const ACTIVE_WALK_KEY = '@active_walk';
-
-// { id: String(startedAt), startedAt: number(ms),
-//   coords: [{ latitude, longitude, timestamp, accuracy }] }
 //
-// 한계(TRK-01 리뷰 6): 아래 queue는 JS 실행 컨텍스트(모듈 인스턴스) 안에서만 직렬화한다.
-// 헤드리스 task와 화면이 서로 다른 컨텍스트면 같은 키의 읽기-수정-쓰기가 겹칠 수 있다.
-// 완화책: 산책 id/startedAt 기준으로 이전 산책·중복 샘플을 버리고, 종료한 산책을 되살리지 않는다.
-// 완전한 원자성(트랜잭션 저장소)은 이번 범위 밖이며 실기기에서 순서만 확인한다.
+// 구조 (TRK-01 재리뷰: 헤드리스 task와 UI가 같은 키를 읽고-수정-쓰지 않도록 분리)
+//   '@active_walk'                          메타만: { id: String(startedAt), startedAt }
+//   '@active_walk_samples:<id>:<첫 ts>'     task 콜백 한 배치의 샘플 배열 (쓰기 전용, 덮어쓰지 않음)
+// 이전 빌드는 '@active_walk'에 coords(또는 samples) 배열을 함께 저장했다. 읽을 때 병합한다.
+//
+// 한계: 배치 키는 배치의 첫 timestamp로 구분한다. 콜백마다 timestamp가 달라 키가 겹치지 않고,
+// 겹쳐도 같은 샘플이라 병합 시 timestamp 중복 제거로 흡수된다. 메타를 지운 직후 도착한 배치는
+// 메타가 없거나 id가 달라 무시되고, 남은 고아 키는 다음 산책 시작 때 지운다.
+// 아래 queue는 한 JS 컨텍스트 안의 순서만 맞춘다 (컨텍스트 간 원자성은 위 구조로 대신한다).
+const META_KEY = '@active_walk';
+const SAMPLES_PREFIX = '@active_walk_samples:';
+
 let queue = Promise.resolve();
 const listeners = new Set();
 
@@ -18,6 +22,8 @@ function enqueue(job) {
   queue = run.catch(() => {});
   return run;
 }
+
+const samplePrefixFor = (id) => `${SAMPLES_PREFIX}${id}:`;
 
 export function toSample(location) {
   return {
@@ -28,68 +34,124 @@ export function toSample(location) {
   };
 }
 
-async function readWalk() {
-  const raw = await AsyncStorage.getItem(ACTIVE_WALK_KEY);
+// 샘플 목록들을 합쳐 timestamp 기준 중복 제거 + 오름차순 정렬. 4개 필드만 남긴다.
+export function mergeSamples(...lists) {
+  const byTimestamp = new Map();
+  for (const list of lists) {
+    for (const s of list ?? []) {
+      if (!s || typeof s.timestamp !== 'number' || byTimestamp.has(s.timestamp)) continue;
+      byTimestamp.set(s.timestamp, {
+        latitude: s.latitude,
+        longitude: s.longitude,
+        timestamp: s.timestamp,
+        accuracy: s.accuracy,
+      });
+    }
+  }
+  return [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+async function readMeta() {
+  const raw = await AsyncStorage.getItem(META_KEY);
   if (!raw) return null;
+  let meta;
   try {
-    const walk = JSON.parse(raw);
-    if (!walk || !Array.isArray(walk.coords)) return null;
-    // id가 없는 이전 형식 기록 호환
-    return walk.id ? walk : { ...walk, id: String(walk.startedAt) };
+    meta = JSON.parse(raw);
   } catch {
     return null;
   }
+  if (!meta || typeof meta.startedAt !== 'number') return null;
+  return { ...meta, id: meta.id ?? String(meta.startedAt) };
 }
 
-export function getActiveWalk() {
-  return enqueue(readWalk);
+async function keysWithPrefix(prefix) {
+  const keys = await AsyncStorage.getAllKeys();
+  return keys.filter((k) => k.startsWith(prefix));
 }
 
-function notify(walk) {
+function notify(payload) {
   listeners.forEach((listener) => {
     try {
-      listener(walk);
+      listener(payload);
     } catch (e) {
       console.warn('[activeWalk] listener error', e);
     }
   });
 }
 
-export function startActiveWalk(walk) {
+// 진행 중 산책 조회: 메타 + 해당 id의 모든 샘플 키를 병합. 읽기 오류는 호출자에게 전달한다.
+export function getActiveWalk() {
   return enqueue(async () => {
-    await AsyncStorage.setItem(ACTIVE_WALK_KEY, JSON.stringify(walk));
-    notify(walk);
+    const meta = await readMeta();
+    if (!meta) return null;
+    const keys = await keysWithPrefix(samplePrefixFor(meta.id));
+    const pairs = keys.length ? await AsyncStorage.multiGet(keys) : [];
+    const lists = [meta.coords, meta.samples];
+    for (const [, value] of pairs) {
+      if (!value) continue;
+      try {
+        const batch = JSON.parse(value);
+        if (Array.isArray(batch)) lists.push(batch);
+      } catch {
+        // 깨진 배치는 건너뛴다
+      }
+    }
+    const coords = mergeSamples(...lists).filter((s) => s.timestamp >= meta.startedAt);
+    return { id: meta.id, startedAt: meta.startedAt, coords };
   });
 }
 
-// 현재 산책의 startedAt 이전 샘플과 이미 있는 timestamp(중복) 샘플은 버린다.
+// 새 산책 시작: 다른 id의 고아 샘플 키를 지우고 메타 + 첫 샘플 배치를 쓴다.
+export function startActiveWalk({ id, startedAt }, initialSamples = []) {
+  return enqueue(async () => {
+    const orphans = (await keysWithPrefix(SAMPLES_PREFIX)).filter(
+      (k) => !k.startsWith(samplePrefixFor(id))
+    );
+    if (orphans.length) await AsyncStorage.multiRemove(orphans);
+    const pairs = [[META_KEY, JSON.stringify({ id, startedAt })]];
+    if (initialSamples.length) {
+      pairs.push([
+        `${samplePrefixFor(id)}${initialSamples[0].timestamp}`,
+        JSON.stringify(initialSamples),
+      ]);
+    }
+    await AsyncStorage.multiSet(pairs);
+  });
+}
+
+// task 콜백용: 메타만 읽고 배치 키에 쓰기만 한다 (공유 키 읽기-수정-쓰기 없음).
 export function appendActiveSamples(samples) {
   return enqueue(async () => {
-    const walk = await readWalk();
-    if (!walk) return null; // 진행 중 산책이 없으면 늦게 온 콜백은 버린다.
-    const seen = new Set(walk.coords.map((c) => c.timestamp));
-    const fresh = [];
-    for (const s of samples) {
-      if (s.timestamp < walk.startedAt || seen.has(s.timestamp)) continue;
-      seen.add(s.timestamp);
-      fresh.push(s);
-    }
-    if (fresh.length === 0) return walk;
-    const updated = { ...walk, coords: [...walk.coords, ...fresh] };
-    await AsyncStorage.setItem(ACTIVE_WALK_KEY, JSON.stringify(updated));
-    notify(updated);
-    return updated;
+    const meta = await readMeta();
+    if (!meta) return null; // 진행 중 산책이 없으면 늦게 온 콜백은 버린다.
+    const fresh = samples.filter((s) => s.timestamp >= meta.startedAt);
+    if (fresh.length === 0) return meta;
+    await AsyncStorage.setItem(
+      `${samplePrefixFor(meta.id)}${fresh[0].timestamp}`,
+      JSON.stringify(fresh)
+    );
+    notify({ id: meta.id, samples: fresh });
+    return meta;
   });
 }
 
-// expectedId를 주면 id가 같은 기록일 때만 지운다 (다른 산책을 잘못 지우지 않도록).
+// 메타와 그 산책의 샘플 키를 모두 지운다. expectedId가 있고 다른 산책의 메타면 지우지 않는다.
+// 삭제 오류와, 지운 뒤에도 키가 남은 경우는 throw (호출자가 성공으로 취급하지 않게).
 export function clearActiveWalk(expectedId) {
   return enqueue(async () => {
-    if (expectedId !== undefined) {
-      const walk = await readWalk();
-      if (walk && walk.id !== expectedId) return;
+    const meta = await readMeta();
+    if (expectedId !== undefined && meta && meta.id !== expectedId) return;
+    const id = meta ? meta.id : expectedId;
+    const keys = await AsyncStorage.getAllKeys();
+    const targets = keys.filter(
+      (k) => k === META_KEY || (id !== undefined && k.startsWith(samplePrefixFor(id)))
+    );
+    if (targets.length === 0) return;
+    await AsyncStorage.multiRemove(targets);
+    const left = new Set(await AsyncStorage.getAllKeys());
+    if (targets.some((k) => left.has(k))) {
+      throw new Error('임시 기록을 지우지 못했습니다.');
     }
-    await AsyncStorage.removeItem(ACTIVE_WALK_KEY);
   });
 }
 
@@ -98,7 +160,7 @@ export function whenActiveWalkIdle() {
   return enqueue(async () => {});
 }
 
-// 앱이 떠 있을 때 화면이 최신 산책 데이터를 받는 구독. 반환값은 해제 함수.
+// 앱이 떠 있을 때 화면이 새 샘플 배치를 받는 구독: listener({ id, samples }). 반환값은 해제 함수.
 export function subscribeActiveWalk(listener) {
   listeners.add(listener);
   return () => listeners.delete(listener);

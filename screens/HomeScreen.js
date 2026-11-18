@@ -71,11 +71,22 @@ export default function HomeScreen() {
   }, [currentLocation]);
 
   // 저장/버리기가 끝난 뒤 임시 기록을 정리하고 종료 상태를 푼다.
+  // 정리 성공을 확인한 뒤에만 완료 상태로 바꾼다. 실패하면 busy를 유지한 채 다시 시도를 안내한다.
+  // ("나중에"를 고르면 busy만 풀고 기록은 남긴다 → 다음 시작 때 pending-walk 경로로 다시 안내됨)
   const finishWalk = async (walkId) => {
     try {
       await clearActiveWalk(walkId);
     } catch (e) {
-      console.warn('[HomeScreen] clearActiveWalk failed', e?.message ?? e);
+      Alert.alert(
+        '정리하지 못했습니다',
+        e?.message ?? '임시 기록을 정리하지 못했습니다.',
+        [
+          { text: '나중에', style: 'cancel', onPress: () => setBusyFlag(false) },
+          { text: '다시 시도', onPress: () => finishWalk(walkId) },
+        ],
+        { cancelable: false }
+      );
+      return;
     }
     resetTracking();
     setElapsed(0);
@@ -202,7 +213,12 @@ export default function HomeScreen() {
     if (busyRef.current) return;
     setBusyFlag(true);
 
-    const result = await stopTracking();
+    let result;
+    try {
+      result = await stopTracking();
+    } catch (e) {
+      result = { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) };
+    }
     if (!result.ok) {
       // 수집이 계속 돌 수 있으므로 산책 중 상태와 임시 기록을 그대로 둔다.
       Alert.alert(
