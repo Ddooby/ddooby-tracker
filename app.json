@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "ddooby-tracker-new",
-    "slug": "ddooby-tracker-new",
+    "name": "ddooby-tracker",
+    "slug": "ddooby-tracker",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -26,14 +26,22 @@
       "edgeToEdgeEnabled": true,
       "permissions": [
         "ACCESS_FINE_LOCATION",
-        "ACCESS_COARSE_LOCATION",
-        "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION"
       ],
       "package": "com.ddooby.tracker"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "isAndroidForegroundServiceEnabled": true,
+          "isAndroidBackgroundLocationEnabled": false,
+          "locationWhenInUsePermission": "산책 경로를 기록하기 위해 위치 정보가 필요합니다."
+        }
+      ]
+    ]
   }
 }
