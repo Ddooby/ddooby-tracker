@@ -17,6 +17,7 @@ import {
   buildWalkRecord,
   calculateElapsedSeconds,
   calculateSpeedKmh,
+  resolveEndedAt,
   SIGNAL_TIMEOUT_MS,
 } from '../utils/track';
 import { saveWalk, hasWalk } from '../storage/walkStorage';
@@ -35,6 +36,9 @@ export default function HomeScreen() {
   const notificationNoticeShownRef = useRef(false);
   // 약한 신호 안내는 산책(startedAt)당 한 번만 띄운다.
   const weakSignalShownForRef = useRef(null);
+  // 첫 종료 요청 시각. 종료 재시도(읽기 실패 등)에서도 새로 잡지 않고 보존하며, 저장/버리기로 끝나거나
+  // 종료를 취소하면 비운다. 서비스 중단이 확정되면 hook이 이 값을 '@active_walk'에 영속화한다.
+  const endRequestRef = useRef(null);
 
   // 화면 시간 = now - startedAt. now는 표시용으로 1초마다 갱신하고, 잠금·백그라운드에서 돌아오면 즉시 갱신한다.
   const [now, setNow] = useState(() => Date.now());
@@ -105,18 +109,25 @@ export default function HomeScreen() {
       );
       return;
     }
+    endRequestRef.current = null;
     resetTracking();
     setBusyFlag(false);
   };
 
   // 저장 → 임시 기록 정리. 저장이 실패하면 임시 기록을 보존하고 다시 안내한다.
-  const saveAndFinish = async (walk, endedAt, title) => {
+  const saveAndFinish = async (walk, endedAt, title, estimated = false) => {
     try {
       // 같은 id가 이미 이력에 있으면(저장 직후 종료된 경우) 다시 저장하지 않는다.
       if (!(await hasWalk(walk.id))) {
         // 좌표는 필터 없는 원본으로 저장하고, 거리·시간은 유효 샘플·실제 시작/종료 시각으로 계산한다.
         await saveWalk(
-          buildWalkRecord({ id: walk.id, coords: walk.coords, startedAt: walk.startedAt, endedAt })
+          buildWalkRecord({
+            id: walk.id,
+            coords: walk.coords,
+            startedAt: walk.startedAt,
+            endedAt,
+            endedAtEstimated: estimated,
+          })
         );
       }
     } catch (e) {
@@ -124,7 +135,7 @@ export default function HomeScreen() {
         '저장하지 못했습니다',
         e?.message ?? '산책 기록을 저장하지 못했습니다.',
         [
-          { text: '다시 시도', onPress: () => saveAndFinish(walk, endedAt, title) },
+          { text: '다시 시도', onPress: () => saveAndFinish(walk, endedAt, title, estimated) },
           { text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) },
         ],
         { cancelable: false }
@@ -134,8 +145,8 @@ export default function HomeScreen() {
     await finishWalk(walk.id);
   };
 
-  // walk: { id, startedAt, coords(원본) }, endedAt: 종료 시각(ms)
-  const promptSave = async (walk, endedAt, title = '산책 종료') => {
+  // walk: { id, startedAt, coords(원본) }, endedAt: 종료 시각(ms), estimated: 마지막 샘플 시각으로 추정한 값인지
+  const promptSave = async (walk, endedAt, title = '산책 종료', estimated = false) => {
     setBusyFlag(true);
     // 저장은 끝났는데 임시 기록만 남은 경우: 다시 묻지 않고 정리만 한다.
     try {
@@ -146,32 +157,37 @@ export default function HomeScreen() {
     } catch (e) {
       console.warn('[HomeScreen] hasWalk failed', e?.message ?? e);
     }
-    if (filterValidSamples(walk.coords).length < 2) {
-      Alert.alert(title, '경로가 너무 짧아 저장하지 않습니다.', [
-        { text: '확인', onPress: () => finishWalk(walk.id) },
-      ], { cancelable: false });
+    // 원본 샘플이 하나도 없으면 저장할 내용이 없으므로 버리기만 제공한다.
+    if (walk.coords.length === 0) {
+      Alert.alert(
+        title,
+        '기록된 위치가 없어 저장할 수 없습니다.',
+        [{ text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) }],
+        { cancelable: false }
+      );
       return;
     }
-
+    // 유효 경로가 2점 미만이어도 자동으로 지우지 않고 선택하게 한다(원본·시간은 그대로 저장, 거리 0).
+    const noValidPath = filterValidSamples(walk.coords).length < 2;
     Alert.alert(
       title,
-      '이번 산책을 저장할까요?',
+      noValidPath
+        ? 'GPS 신호가 약해 경로를 측정하지 못했습니다. 저장하면 기록된 위치와 시간만 저장되고 거리는 0m입니다. 저장할까요?'
+        : '이번 산책을 저장할까요?',
       [
-        { text: '저장', onPress: () => saveAndFinish(walk, endedAt, title) },
+        { text: '저장', onPress: () => saveAndFinish(walk, endedAt, title, estimated) },
         { text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) },
       ],
       { cancelable: false }
     );
   };
 
-  // 중단된 산책의 종료 시각은 마지막으로 수집된 샘플 시각(없으면 시작 시각)
-  const interruptedEndedAt = (walk) => {
-    const last = walk.coords[walk.coords.length - 1];
-    return last ? Math.max(walk.startedAt, last.timestamp) : walk.startedAt;
+  // 종료 시각이 영속화돼 있으면 그 값을 쓴다. OS가 수집을 중단해 종료 시각이 없는 경우에만 마지막으로
+  // 수집된 샘플 시각을 하한으로 추정하고 기록에 endedAtEstimated를 표시한다(resolveEndedAt).
+  const promptInterrupted = (walk) => {
+    const { endedAt, estimated } = resolveEndedAt(walk);
+    promptSave(walk, endedAt, '이전 산책이 중단되었습니다', estimated);
   };
-
-  const promptInterrupted = (walk) =>
-    promptSave(walk, interruptedEndedAt(walk), '이전 산책이 중단되었습니다');
 
   // 서비스가 중단된 채 남은 이전 산책 → 저장/버리기 확인
   useEffect(() => {
@@ -227,11 +243,13 @@ export default function HomeScreen() {
   const handleStop = async (discard = false) => {
     if (busyRef.current) return;
     setBusyFlag(true);
-    const endedAt = Date.now(); // 사용자가 종료를 누른 시각 (중단 처리 지연과 무관)
+    // 사용자가 처음 종료를 누른 시각 (중단 처리 지연·재시도와 무관하게 보존)
+    if (endRequestRef.current === null) endRequestRef.current = Date.now();
+    const endedAt = endRequestRef.current;
 
     let result;
     try {
-      result = await stopTracking();
+      result = await stopTracking(endedAt);
     } catch (e) {
       result = { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) };
     }
@@ -241,7 +259,14 @@ export default function HomeScreen() {
         '종료하지 못했습니다',
         result.message,
         [
-          { text: '취소', style: 'cancel', onPress: () => setBusyFlag(false) },
+          {
+            text: '취소',
+            style: 'cancel',
+            onPress: () => {
+              endRequestRef.current = null; // 종료를 취소했으니 다음 종료 요청은 새 시각을 쓴다
+              setBusyFlag(false);
+            },
+          },
           {
             text: '다시 시도',
             onPress: () => {
@@ -260,7 +285,8 @@ export default function HomeScreen() {
       finishWalk(walk.id);
       return;
     }
-    promptSave(walk, endedAt);
+    // 영속화된 종료 시각(재시도 시 처음 값)을 우선 사용한다.
+    promptSave(walk, walk.endedAt ?? endedAt);
   };
 
   // 시작 후 30초 안에 유효 샘플(accuracy ≤ 20m)이 없으면 안내한다. 그대로 시작하면 계속 기다리고

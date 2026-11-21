@@ -9,6 +9,7 @@ import {
   whenActiveWalkIdle,
   subscribeActiveWalk,
   cleanupOrphanSamples,
+  markActiveWalkEnded,
   mergeSamples,
   newWalkId,
 } from '../storage/activeWalk';
@@ -110,7 +111,7 @@ async function cleanupService() {
 //   { ok: false, reason: 'pending-walk', walk }   // 서비스는 꺼졌는데 이전 기록이 남음
 //   { ok: false, reason: 'error', message }
 // stopTracking 반환:
-//   { ok: true, walk }  // walk: { id, startedAt, coords(원본) } | null
+//   { ok: true, walk }  // walk: { id, startedAt, endedAt, coords(원본) } | null (endedAt: 영속화된 종료 시각)
 //   { ok: false, reason: 'stop-failed' | 'read-failed', message }
 // 노출 값: coords(원본), validCoords(유효 샘플), currentLocation(마지막 유효 샘플),
 //   acquiring(산책 중인데 아직 유효 샘플이 없음 = GPS 신호 찾는 중)
@@ -158,7 +159,11 @@ export default function useLocation() {
         const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
         const walk = await getActiveWalk();
         if (!mountedRef.current) return;
-        if (walk && running) {
+        if (walk && running && walk.endedAt !== undefined) {
+          // 종료 시각이 이미 기록된 산책인데 서비스가 남아 있으면 계속 수집하지 않고 저장/버리기로 보낸다.
+          await cleanupService();
+          setInterruptedWalk(walk);
+        } else if (walk && running) {
           if (await hasForegroundPermission()) {
             // 프로세스가 죽었다 복원되면 포그라운드 서비스(알림)가 없으므로 다시 띄운다.
             try {
@@ -244,8 +249,10 @@ export default function useLocation() {
 
   // 수집 중단을 확인한 뒤 임시 기록을 읽어 반환한다. 어느 단계든 실패하면 isTracking과 임시 기록을
   // 그대로 두고 실패를 반환한다. 재시도할 때 서비스가 이미 멈춰 있으면 중단은 건너뛰고 기록만 읽는다.
+  // endedAt: 사용자가 처음 종료를 요청한 시각(ms). 서비스 중단이 확정되면 읽기 전에 메타에 영속화하고,
+  // 이미 기록된 값이 있으면 그 값을 쓴다(재시도·재실행에서 종료 시각이 달라지지 않게).
   const stopTracking = useCallback(
-    () =>
+    (endedAt) =>
       runExclusive(async () => {
         try {
           if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME)) {
@@ -257,6 +264,10 @@ export default function useLocation() {
         try {
           await whenActiveWalkIdle();
           const walk = await getActiveWalk();
+          if (walk && typeof endedAt === 'number') {
+            const persisted = await markActiveWalkEnded(walk.id, endedAt);
+            walk.endedAt = persisted ?? endedAt;
+          }
           if (mountedRef.current) setIsTracking(false);
           return { ok: true, walk };
         } catch (e) {

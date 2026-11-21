@@ -3,7 +3,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // 진행 중 산책 임시 저장소. '@walks_history'와 별개이며 저장/버리기 확정 시 삭제한다.
 //
 // 구조 (헤드리스 task와 UI가 같은 키를 읽고-수정-쓰지 않도록 분리)
-//   '@active_walk'                                   메타만: { id, startedAt }
+//   '@active_walk'                                   메타만: { id, startedAt, endedAt? }
+//     endedAt: 사용자가 종료를 눌러 서비스 중단이 확정된 뒤 기록하는 종료 시각(ms). 한 번 기록되면 유지된다.
 //   '@active_walk_samples:<id>:<첫 ts>:<배치 id>'    task 콜백 한 배치의 샘플 배열 (쓰기 전용)
 //   '@active_walk_samples:<id>:<첫 ts>:init'         시작 시 첫 샘플 (별도 키, startedAt 필터 제외)
 // 산책 id는 위치 timestamp와 무관한 고유값(newWalkId), 배치 id는 TaskManager eventId(없으면 무작위)라서
@@ -108,7 +109,21 @@ export function getActiveWalk() {
     }
     // 이전 형식 배열(coords/samples)은 필터 없이 그대로 병합한다.
     const coords = mergeSamples(meta.coords, meta.samples, ...batches);
-    return { id: meta.id, startedAt: meta.startedAt, coords };
+    const endedAt = typeof meta.endedAt === 'number' ? meta.endedAt : undefined;
+    return { id: meta.id, startedAt: meta.startedAt, endedAt, coords };
+  });
+}
+
+// 종료 시각을 메타에 영속화한다(메타 전용, 샘플 키는 건드리지 않는다). 이미 기록돼 있으면 처음 값을 유지하고
+// 그 값을 반환한다. 메타가 없거나 id가 다르면 null. 쓰기 오류는 호출자에게 전달한다.
+export function markActiveWalkEnded(id, endedAt) {
+  return enqueue(async () => {
+    const meta = await readMeta();
+    if (!meta || meta.id !== id) return null;
+    if (typeof meta.endedAt === 'number') return meta.endedAt;
+    // 이전 형식 메타(인라인 coords/samples)도 잃지 않도록 메타 전체를 그대로 두고 endedAt만 더한다.
+    await AsyncStorage.setItem(META_KEY, JSON.stringify({ ...meta, endedAt }));
+    return endedAt;
   });
 }
 

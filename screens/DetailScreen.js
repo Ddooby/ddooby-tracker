@@ -39,6 +39,12 @@ export default function DetailScreen({ route }) {
 
       <View style={styles.infoBox}>
         <Text style={styles.dateText}>{dateStr}</Text>
+        {walk.quality === 'no-valid-path' && (
+          <Text style={styles.noticeText}>경로 측정 불가 (GPS 신호 약함 — 위치 원본과 시간만 기록됨)</Text>
+        )}
+        {walk.endedAtEstimated && (
+          <Text style={styles.noticeText}>종료 시각은 마지막 위치 기록 기준 추정값입니다</Text>
+        )}
         <View style={styles.statsRow}>
           <StatItem label="거리" value={formatDistance(summary.distanceMeters)} />
           <View style={styles.divider} />
@@ -76,6 +82,7 @@ const styles = StyleSheet.create({
     borderColor: '#e5e7eb',
   },
   dateText: { fontSize: 14, color: '#6b7280', marginBottom: 16 },
+  noticeText: { fontSize: 13, color: '#b45309', marginBottom: 12 },
   statsRow: {
     flexDirection: 'row',
     justifyContent: 'space-around',
