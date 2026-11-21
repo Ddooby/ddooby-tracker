@@ -10,6 +10,7 @@ import {
   subscribeActiveWalk,
   cleanupOrphanSamples,
   finishCollection,
+  heartbeatStep,
   beatIfServiceAlive,
   mergeSamples,
   newWalkId,
@@ -120,12 +121,14 @@ export default function useLocation() {
   const [coords, setCoords] = useState([]);
   const [isTracking, setIsTracking] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
+  const [lostPending, setLostPending] = useState(false);
   const [restoring, setRestoring] = useState(true);
   // 수집 중이 아닌데 기록이 남은 경우(서비스 중단·권한 회수): 화면이 저장/버리기를 묻도록 노출
   const [interruptedWalk, setInterruptedWalk] = useState(null);
   const mountedRef = useRef(true);
   const walkIdRef = useRef(null);
   const opChainRef = useRef(Promise.resolve());
+  const lostPendingRef = useRef(false); // lost 확인 후 전환(임시 기록 읽기)이 끝나지 않은 상태
   const opPendingRef = useRef(0); // 진행 중인 시작·복원·종료 작업 수(하트비트는 이 동안 건너뛴다)
 
   // 시작·복원·종료를 한 번에 하나씩만 실행한다.
@@ -287,35 +290,45 @@ export default function useLocation() {
     [runExclusive]
   );
 
-  // 하트비트(HomeScreen이 5초 목표로 호출): 서비스 실행·foreground 권한을 확인한 뒤에만 lastAliveAt을 쓴다.
-  // 반환: 'alive' | 'skipped'(시작·복원·종료 작업 중) | 'lost'(서비스 중단·권한 없음·확인 오류).
-  // lost이고 transition=true면 수집 중 표시를 내리고 기존 "중단된 산책" 저장/버리기 경로로 보낸다
-  // (추정 종료 시각은 마지막 샘플·마지막 정상 하트비트 기준). transition=false는 기록 여부만 결정한다.
+  // 하트비트(HomeScreen이 주기적으로 호출): 서비스 실행·foreground 권한을 확인한 뒤에만 lastAliveAt을 쓴다.
+  // 반환: 'alive' | 'unknown'(조회 예외: 서비스는 그대로, 다음 주기에 재조회) | 'skipped'(시작·복원·종료 작업 중)
+  //   | 'lost-pending'(중단 확인, 임시 기록 읽기 실패 → 하트비트를 멈추지 말고 다음 주기에 재시도)
+  //   | 'lost'(전환 완료: 중단된 산책 저장/버리기 경로). transition=false는 확인 후 기록만 한다(전환 없음).
+  // lost를 확인하면 먼저 isTracking=false로 내려 화면 시간을 멈추고, 읽기·정리에 성공해야만 interruptedWalk를 설정한다.
+  // 조회 오류(unknown)는 반복돼도 서비스를 멈추지 않는다(수집 지속이 안전한 기본값).
   const heartbeat = useCallback(
     async ({ transition = true } = {}) => {
       if (opPendingRef.current > 0 || !mountedRef.current) return 'skipped';
-      const status = await beatIfServiceAlive({
-        walkId: walkIdRef.current ?? undefined,
+      const probes = {
         isServiceRunning: () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME),
-        hasPermission: hasForegroundPermission,
+        hasPermission: async () => (await Location.getForegroundPermissionsAsync()).status === 'granted',
+      };
+      if (!transition) {
+        // 확인 후 기록만 한다(전환·서비스 정리 없음). 전환이 진행 중이면 기록하지 않는다.
+        if (lostPendingRef.current) return 'lost-pending';
+        return beatIfServiceAlive({ walkId: walkIdRef.current ?? undefined, ...probes });
+      }
+      return runExclusive(async () => {
+        if (!mountedRef.current) return 'skipped';
+        const result = await heartbeatStep({
+          lostPending: lostPendingRef.current,
+          walkId: walkIdRef.current ?? undefined,
+          ...probes,
+          cleanupService,
+          onLostDetected: () => {
+            lostPendingRef.current = true;
+            setLostPending(true);
+            setIsTracking(false); // 먼저 화면 수집 상태를 내려 시간을 멈춘다
+          },
+        });
+        if (result.status !== 'lost') return result.status; // alive | unknown | lost-pending
+        // 읽기·정리까지 성공했을 때만 전환을 완료한다.
+        lostPendingRef.current = false;
+        setLostPending(false);
+        const { walk } = result;
+        if (mountedRef.current && walk && walk.endedAt === undefined) setInterruptedWalk(walk);
+        return 'lost';
       });
-      if (status !== 'lost' || !transition) return status;
-      await runExclusive(async () => {
-        if (!mountedRef.current) return;
-        try {
-          const walk = await getActiveWalk();
-          await cleanupService(); // 남아 있을 수 있는 서비스·알림 정리(실패는 경고만)
-          if (walk && walk.endedAt === undefined) {
-            setIsTracking(false);
-            setInterruptedWalk(walk);
-          } else if (!walk) {
-            setIsTracking(false);
-          }
-        } catch (e) {
-          console.warn('[useLocation] lost-service transition failed', e?.message ?? e);
-        }
-      });
-      return 'lost';
     },
     [runExclusive]
   );
@@ -343,6 +356,7 @@ export default function useLocation() {
     startedAt,
     restoring,
     heartbeat,
+    lostPending,
     interruptedWalk,
     startTracking,
     stopTracking,

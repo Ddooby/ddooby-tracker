@@ -181,23 +181,62 @@ export function touchActiveWalkAlive(id, at) {
   });
 }
 
-// 하트비트: 서비스가 실행 중이고 foreground 권한이 있음을 확인한 뒤에만 lastAliveAt을 쓴다.
-// 서비스 중단·권한 없음·확인 오류면 쓰지 않고 'lost'를 반환한다(호출자가 하트비트를 멈추고 중단된 산책 경로로
-// 전환). 확인 뒤 Date.now()를 읽으므로 기록 시각은 확인 시점이다. 기록 오류는 무시한다('alive').
+// 하트비트 판정(서비스·foreground 권한 확인 후에만 lastAliveAt 기록):
+//   'alive'   서비스 실행 중 + 권한 granted 로 확인 → lastAliveAt 기록
+//   'lost'    hasStarted=false 이거나 권한 status가 granted가 아님으로 "확인"됨 → 기록하지 않음
+//   'unknown' 조회가 예외 → 기록하지 않음. 서비스 중단·전환은 하지 않는다(호출자는 다음 주기에 재조회).
+// 권한 조회 예외를 false(=권한 없음)로 바꾸지 않는다: 수집 지속이 안전한 기본값이다. 기록 오류는 무시한다.
 export async function beatIfServiceAlive({ walkId, isServiceRunning, hasPermission, now = Date.now }) {
-  let alive = false;
+  let running;
   try {
-    alive = Boolean(await isServiceRunning()) && Boolean(await hasPermission());
+    running = Boolean(await isServiceRunning());
   } catch {
-    alive = false;
+    return 'unknown';
   }
-  if (!alive) return 'lost';
+  if (!running) return 'lost';
+  let granted;
+  try {
+    granted = Boolean(await hasPermission());
+  } catch {
+    return 'unknown';
+  }
+  if (!granted) return 'lost';
   try {
     await touchActiveWalkAlive(walkId, now());
   } catch (e) {
     console.warn('[activeWalk] heartbeat write failed', e?.message ?? e);
   }
   return 'alive';
+}
+
+// 하트비트 한 주기. 반환:
+//   { status: 'alive' | 'unknown' }  기록했거나(alive) 조회가 불확실(unknown: 서비스는 그대로 두고 다음 주기에 재조회,
+//                                     반복 실패해도 서비스는 멈추지 않는다)
+//   { status: 'lost', walk }         서비스 중단·권한 없음이 확인됐고 임시 기록 읽기·서비스 정리까지 끝남(전환 완료)
+//   { status: 'lost-pending' }       lost는 확인됐지만 읽기가 실패 → 완료로 보지 않으며 호출자는 하트비트를
+//                                     멈추지 말고 다음 주기에 (lostPending=true로) 읽기·정리를 재시도한다
+// lost를 처음 확인한 순간 onLostDetected를 한 번 호출한다(호출자가 화면 수집 상태를 먼저 내리는 용도).
+export async function heartbeatStep({
+  lostPending = false,
+  walkId,
+  isServiceRunning,
+  hasPermission,
+  cleanupService,
+  onLostDetected,
+  now = Date.now,
+}) {
+  if (!lostPending) {
+    const status = await beatIfServiceAlive({ walkId, isServiceRunning, hasPermission, now });
+    if (status !== 'lost') return { status };
+    onLostDetected?.();
+  }
+  try {
+    await cleanupService(); // 남은 서비스·알림 정리(구현은 실패를 경고로만 남김)
+    const walk = await getActiveWalk();
+    return { status: 'lost', walk };
+  } catch {
+    return { status: 'lost-pending' };
+  }
 }
 
 // 서비스를 끝내 멈추지 못했을 때 영속화한 종료 시각을 지운다(수집이 계속되는 산책으로 되돌린다). 메타 전용.

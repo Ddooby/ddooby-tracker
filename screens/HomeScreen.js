@@ -54,6 +54,7 @@ export default function HomeScreen() {
     startedAt,
     restoring,
     heartbeat,
+    lostPending,
     interruptedWalk,
     startTracking,
     stopTracking,
@@ -85,7 +86,8 @@ export default function HomeScreen() {
   // 수집 중 표시를 내려 "중단된 산책" 저장/버리기 경로로 전환한다. 강제 종료로 종료 시각을 영속화하지 못해도
   // 복원이 마지막 샘플·마지막 정상 하트비트까지를 하한으로 쓴다(endedAtEstimated). 백그라운드에서는 쓰지 않는다.
   useEffect(() => {
-    if (!isTracking) return undefined;
+    // lost 전환의 읽기가 실패해 재시도 중(lostPending)이면 isTracking이 꺼져 있어도 하트비트를 계속 돈다.
+    if (!isTracking && !lostPending) return undefined;
     let timer = null;
     const beat = () => {
       heartbeat().then(
@@ -113,7 +115,7 @@ export default function HomeScreen() {
       stop();
       sub.remove();
     };
-  }, [isTracking, heartbeat]);
+  }, [isTracking, lostPending, heartbeat]);
 
   useEffect(() => {
     if (currentLocation && mapRef.current) {
