@@ -267,8 +267,10 @@ export default function useLocation() {
           isServiceRunning: () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME),
           stopService: stopAndVerify,
         });
-        // 서비스가 멈췄으면(성공, 또는 멈춘 뒤 읽기 실패) 수집 중처럼 보이지 않게 한다.
-        if ((result.ok || result.reason === 'read-failed') && mountedRef.current) setIsTracking(false);
+        // 서비스가 멈췄거나(성공·읽기 실패) 멈췄는지 확인하지 못했으면(stop-unconfirmed) 수집 중처럼 보이지 않게
+        // 한다. 확인된 stop-failed(계속 수집 중)만 수집 중 상태를 유지한다.
+        const stoppedOrUnknown = result.ok || result.reason === 'read-failed' || result.reason === 'stop-unconfirmed';
+        if (stoppedOrUnknown && mountedRef.current) setIsTracking(false);
         return result;
       }),
     [runExclusive]

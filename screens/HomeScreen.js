@@ -18,9 +18,11 @@ import {
   calculateElapsedSeconds,
   calculateSpeedKmh,
   resolveEndedAt,
+  ALIVE_HEARTBEAT_MS,
   SIGNAL_TIMEOUT_MS,
 } from '../utils/track';
 import { saveWalk, hasWalk } from '../storage/walkStorage';
+import { touchActiveWalkAlive } from '../storage/activeWalk';
 
 const INITIAL_REGION = {
   latitude: 37.5665,
@@ -77,6 +79,34 @@ export default function HomeScreen() {
       sub.remove();
     };
   }, [isTracking, startedAt]);
+
+  // 산책 중 앱이 화면에 있는 동안 5초마다(그리고 화면 복귀 즉시) 메타에 lastAliveAt을 기록한다.
+  // 강제 종료로 종료 시각을 영속화하지 못해도 복원이 이 시각까지를 하한으로 쓴다. 백그라운드에서는 쓰지 않는다.
+  useEffect(() => {
+    if (!isTracking) return undefined;
+    let timer = null;
+    const beat = () => {
+      touchActiveWalkAlive(undefined, Date.now()).catch(() => {});
+    };
+    const start = () => {
+      if (timer) return;
+      beat();
+      timer = setInterval(beat, ALIVE_HEARTBEAT_MS);
+    };
+    const stop = () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    };
+    if (AppState.currentState === 'active') start();
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') start();
+      else stop();
+    });
+    return () => {
+      stop();
+      sub.remove();
+    };
+  }, [isTracking]);
 
   useEffect(() => {
     if (currentLocation && mapRef.current) {
@@ -250,15 +280,16 @@ export default function HomeScreen() {
     if (!result.ok) {
       // 수집이 계속 돌 수 있으므로 산책 중 상태와 임시 기록을 그대로 둔다.
       Alert.alert(
-        '종료하지 못했습니다',
+        result.reason === 'stop-unconfirmed' ? '종료를 확인하지 못했습니다' : '종료하지 못했습니다',
         result.message,
         [
           {
             text: '취소',
             style: 'cancel',
             onPress: () => {
-              // 서비스가 계속 수집 중인 경우(stop-failed)만 종료 요청을 비운다. 이미 멈춘 뒤 읽기가 실패한
-              // 경우(read-failed)는 종료 시각(ref·메타)을 보존해 다음 시도가 같은 시각을 쓰게 한다.
+              // 서비스가 계속 수집 중임이 확인된 경우(stop-failed)만 종료 요청을 비운다. 이미 멈춘 뒤 읽기가
+              // 실패했거나(read-failed) 중단 여부를 확인하지 못한 경우(stop-unconfirmed)는 종료 시각(ref·메타)을
+              // 보존해 다음 시도·복원이 같은 시각을 쓰게 한다.
               if (result.reason === 'stop-failed') endRequestRef.current = null;
               setBusyFlag(false);
             },
@@ -344,6 +375,10 @@ export default function HomeScreen() {
         ) : isTracking ? (
           <TouchableOpacity
             style={[styles.btn, styles.stopBtn, busy && styles.btnDisabled]}
+            onPressIn={() => {
+              // 종료 요청 영속화 전 강제 종료에 대비해 손가락이 닿는 즉시 살아 있던 시각을 남긴다.
+              touchActiveWalkAlive(undefined, Date.now()).catch(() => {});
+            }}
             onPress={() => handleStop()}
             disabled={busy}
           >

@@ -5,6 +5,7 @@ export const MAX_ACCURACY_M = 20; // 보고 정확도가 이 값 이하인 샘�
 export const MAX_SPEED_KMH = 25; // 직전 유효 샘플 대비 이 속도를 넘는 이동은 GPS 오류로 본다
 export const SIGNAL_TIMEOUT_MS = 30000; // 시작 후 유효 샘플을 기다리는 시간(초과 시 안내)
 export const CALC_VERSION = 1;
+export const ALIVE_HEARTBEAT_MS = 5000; // 앱이 화면에 있고 산책 중일 때 lastAliveAt을 기록하는 간격(추정 종료 시각 오차 상한)
 export const QUALITY_NO_VALID_PATH = 'no-valid-path'; // 유효 샘플이 2개 미만이라 경로를 측정하지 못한 기록
 export const QUALITY_NO_LOCATION = 'no-location'; // 위치 샘플이 하나도 없는 기록(시간만 저장)
 
@@ -54,14 +55,17 @@ export function calculateSpeedKmh(distanceMeters, elapsedSeconds) {
 }
 
 // 저장되지 않은 산책의 종료 시각. 영속화된 endedAt(사용자 종료 요청)이 있으면 그 값을, 없으면(OS가 수집을
-// 중단한 경우) 마지막 샘플 시각(없으면 시작 시각)을 하한 추정값으로 쓴다(estimated=true).
+// 중단한 경우) max(마지막 샘플 시각, lastAliveAt, 시작 시각)을 하한 추정값으로 쓴다(estimated=true).
+// lastAliveAt은 앱이 화면에 있는 동안 ALIVE_HEARTBEAT_MS마다 메타에 기록한 시각이라 샘플이 드문(정지·실내)
+// 산책에서도 추정 오차를 줄인다.
 export function resolveEndedAt(walk) {
   if (typeof walk.endedAt === 'number') {
     return { endedAt: Math.max(walk.startedAt, walk.endedAt), estimated: false };
   }
   const last = Array.isArray(walk.coords) ? walk.coords[walk.coords.length - 1] : null;
   const lastTs = last && typeof last.timestamp === 'number' ? last.timestamp : walk.startedAt;
-  return { endedAt: Math.max(walk.startedAt, lastTs), estimated: true };
+  const alive = typeof walk.lastAliveAt === 'number' ? walk.lastAliveAt : walk.startedAt;
+  return { endedAt: Math.max(walk.startedAt, lastTs, alive), estimated: true };
 }
 
 // 새 이력 레코드. coords는 필터 없는 원본, distance/duration은 이전 화면 호환용 별칭.

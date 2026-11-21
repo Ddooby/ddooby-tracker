@@ -3,7 +3,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // 진행 중 산책 임시 저장소. '@walks_history'와 별개이며 저장/버리기 확정 시 삭제한다.
 //
 // 구조 (헤드리스 task와 UI가 같은 키를 읽고-수정-쓰지 않도록 분리)
-//   '@active_walk'                                   메타만: { id, startedAt, endedAt? }
+//   '@active_walk'                                   메타만: { id, startedAt, endedAt?, lastAliveAt? }
+//     lastAliveAt: 앱이 화면에 있는 동안 주기적으로 기록하는 "마지막으로 살아 있던 시각"(추정 종료 시각용)
 //     endedAt: 사용자가 종료를 눌러 서비스 중단이 확정된 뒤 기록하는 종료 시각(ms). 한 번 기록되면 유지된다.
 //   '@active_walk_samples:<id>:<첫 ts>:<배치 id>'    task 콜백 한 배치의 샘플 배열 (쓰기 전용)
 //   '@active_walk_samples:<id>:<첫 ts>:init'         시작 시 첫 샘플 (별도 키, startedAt 필터 제외)
@@ -110,21 +111,22 @@ export function getActiveWalk() {
     // 이전 형식 배열(coords/samples)은 필터 없이 그대로 병합한다.
     const coords = mergeSamples(meta.coords, meta.samples, ...batches);
     const endedAt = typeof meta.endedAt === 'number' ? meta.endedAt : undefined;
-    return { id: meta.id, startedAt: meta.startedAt, endedAt, coords };
+    const lastAliveAt = typeof meta.lastAliveAt === 'number' ? meta.lastAliveAt : undefined;
+    return { id: meta.id, startedAt: meta.startedAt, endedAt, lastAliveAt, coords };
   });
 }
 
 // 종료 시각을 메타에 영속화한다(메타 전용, 샘플 키는 건드리지 않는다). 전체 샘플을 읽기 전에 호출한다.
-// 이미 기록돼 있으면 처음 값을 유지하고 그 값을 반환한다. 메타가 없거나 id(주어진 경우)가 다르면 null.
-// 쓰기 오류는 호출자에게 전달한다.
+// 이미 기록돼 있으면 처음 값을 유지한다. 반환: { endedAt, created } — created는 이번 호출에서 새로 쓴 값인지
+// 여부(기존 값이면 false). 메타가 없거나 id(주어진 경우)가 다르면 null. 쓰기 오류는 호출자에게 전달한다.
 export function markActiveWalkEnded(id, endedAt) {
   return enqueue(async () => {
     const meta = await readMeta();
     if (!meta || (id !== undefined && id !== null && meta.id !== id)) return null;
-    if (typeof meta.endedAt === 'number') return meta.endedAt;
+    if (typeof meta.endedAt === 'number') return { endedAt: meta.endedAt, created: false };
     // 이전 형식 메타(인라인 coords/samples)도 잃지 않도록 메타 전체를 그대로 두고 endedAt만 더한다.
     await AsyncStorage.setItem(META_KEY, JSON.stringify({ ...meta, endedAt }));
-    return endedAt;
+    return { endedAt, created: true };
   });
 }
 
@@ -166,6 +168,19 @@ export function appendActiveSamples(samples, batchId) {
   });
 }
 
+// 산책 중 앱이 화면에 있을 때 "마지막으로 살아 있던 시각"을 메타에 기록한다(메타 전용, 샘플 키 불변, 직렬 큐).
+// 이미 종료 시각이 기록됐거나 메타가 없거나 id가 다르면, 또는 더 이른 시각이면 쓰지 않는다. 호출자는 오류를 무시해도 된다.
+export function touchActiveWalkAlive(id, at) {
+  return enqueue(async () => {
+    const meta = await readMeta();
+    if (!meta || (id !== undefined && id !== null && meta.id !== id)) return false;
+    if (typeof meta.endedAt === 'number') return false;
+    if (typeof meta.lastAliveAt === 'number' && meta.lastAliveAt >= at) return false;
+    await AsyncStorage.setItem(META_KEY, JSON.stringify({ ...meta, lastAliveAt: at }));
+    return true;
+  });
+}
+
 // 서비스를 끝내 멈추지 못했을 때 영속화한 종료 시각을 지운다(수집이 계속되는 산책으로 되돌린다). 메타 전용.
 export function clearActiveWalkEnded(id) {
   return enqueue(async () => {
@@ -178,28 +193,64 @@ export function clearActiveWalkEnded(id) {
 }
 
 // 산책 종료 시퀀스(서비스 중단 + 임시 기록 읽기). 위치 라이브러리와 분리하려고 서비스 제어는 주입받는다.
-// 1) 종료 시각을 메타에 먼저 영속화(첫 값 유지) → 2) 서비스 중단(stopService, 실패 시 영속화한 종료 시각을
-// 지우고 수집 지속) → 3) 임시 기록 읽기(실패해도 종료 시각은 메타에 남는다).
-// 반환: { ok: true, walk }(walk.endedAt = 영속 값) | { ok: false, reason: 'stop-failed' | 'read-failed', message }
-//   read-failed는 서비스가 이미 멈춘 상태다.
+// 1) 종료 시각을 메타에 먼저 영속화(첫 값 유지) → 2) 서비스 상태 확인·중단 → 3) 임시 기록 읽기.
+// 영속화한 종료 시각은 "이번 시도에서 새로 쓴 값"이고 "서비스가 계속 실행 중임을 확인한" 경우에만 지운다
+// (stop-failed). 상태 조회가 오류이거나 중단 여부가 불확실하면(stop-unconfirmed) 지우지 않는다.
+// 반환: { ok: true, walk }(walk.endedAt = 영속 값)
+//   | { ok: false, reason: 'stop-failed', message }       서비스가 계속 실행 중임을 확인(수집 지속)
+//   | { ok: false, reason: 'stop-unconfirmed', message }  중단 여부를 확인하지 못함(종료 시각 보존, 재시도·복원이 사용)
+//   | { ok: false, reason: 'read-failed', message }       서비스는 이미 멈춤(종료 시각 보존)
 export async function finishCollection({ walkId, endedAt, isServiceRunning, stopService }) {
   let persisted;
+  let created = false;
   if (typeof endedAt === 'number') {
     try {
-      persisted = (await markActiveWalkEnded(walkId, endedAt)) ?? undefined;
+      const marked = await markActiveWalkEnded(walkId, endedAt);
+      if (marked) {
+        persisted = marked.endedAt;
+        created = marked.created;
+      }
     } catch (e) {
-      return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) }; // 아직 수집 중
+      return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) }; // 쓰기 전: 서비스는 그대로
     }
   }
-  try {
-    if (await isServiceRunning()) await stopService();
-  } catch (e) {
-    try {
-      await clearActiveWalkEnded(walkId);
-    } catch (clearError) {
-      console.warn('[activeWalk] clear endedAt failed', clearError?.message ?? clearError);
+  const unconfirmed = (e) => ({
+    ok: false,
+    reason: 'stop-unconfirmed',
+    message: e?.message ?? String(e ?? '서비스 상태를 확인하지 못했습니다.'),
+  });
+  const confirmedRunning = async (e) => {
+    // 이번 시도에서 새로 쓴 종료 시각만 지운다(기존 값은 그대로).
+    if (created) {
+      try {
+        await clearActiveWalkEnded(walkId);
+      } catch (clearError) {
+        console.warn('[activeWalk] clear endedAt failed', clearError?.message ?? clearError);
+      }
     }
     return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) };
+  };
+
+  let running;
+  try {
+    running = await isServiceRunning();
+  } catch (e) {
+    return unconfirmed(e);
+  }
+  if (running) {
+    try {
+      await stopService();
+    } catch (stopError) {
+      // 중단 실패가 곧 "계속 실행 중"은 아니다: 다시 조회해 실행 중임이 확인된 경우에만 stop-failed.
+      let stillRunning;
+      try {
+        stillRunning = await isServiceRunning();
+      } catch (e) {
+        return unconfirmed(e);
+      }
+      if (stillRunning) return confirmedRunning(stopError);
+      // 오류가 있었지만 서비스는 멈춰 있다 → 읽기로 진행
+    }
   }
   try {
     await whenActiveWalkIdle();
