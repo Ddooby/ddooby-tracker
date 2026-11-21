@@ -2,13 +2,16 @@ import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import { formatDistance, formatDuration } from '../utils/distance';
+import { getWalkSummary, getWalkMapCoords, calculateSpeedKmh } from '../utils/track';
 
 export default function DetailScreen({ route }) {
   const { walk } = route.params;
 
-  const coords = walk.coords;
+  // 새 기록은 유효 샘플로, 구 기록은 저장된 좌표 그대로 그린다. 거리·시간도 새 필드가 있으면 그것을 쓴다.
+  const summary = getWalkSummary(walk);
+  const coords = getWalkMapCoords(walk);
   const midIndex = Math.floor(coords.length / 2);
-  const center = coords[midIndex] || coords[0];
+  const center = coords[midIndex] || coords[0] || walk.coords?.[0] || { latitude: 37.5665, longitude: 126.978 };
 
   const date = new Date(walk.date);
   const dateStr = `${date.getFullYear()}.${String(date.getMonth() + 1).padStart(2, '0')}.${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
@@ -25,23 +28,27 @@ export default function DetailScreen({ route }) {
         scrollEnabled={false}
         zoomEnabled={false}
       >
-        <Marker coordinate={coords[0]} pinColor="blue" title="출발" />
-        <Marker coordinate={coords[coords.length - 1]} pinColor="red" title="도착" />
-        <Polyline coordinates={coords} strokeColor="#22c55e" strokeWidth={4} />
+        {coords.length > 0 && <Marker coordinate={coords[0]} pinColor="blue" title="출발" />}
+        {coords.length > 0 && (
+          <Marker coordinate={coords[coords.length - 1]} pinColor="red" title="도착" />
+        )}
+        {coords.length > 1 && (
+          <Polyline coordinates={coords} strokeColor="#22c55e" strokeWidth={4} />
+        )}
       </MapView>
 
       <View style={styles.infoBox}>
         <Text style={styles.dateText}>{dateStr}</Text>
         <View style={styles.statsRow}>
-          <StatItem label="거리" value={formatDistance(walk.distance)} />
+          <StatItem label="거리" value={formatDistance(summary.distanceMeters)} />
           <View style={styles.divider} />
-          <StatItem label="시간" value={formatDuration(walk.duration)} />
+          <StatItem label="시간" value={formatDuration(summary.elapsedSeconds)} />
           <View style={styles.divider} />
           <StatItem
             label="평균속도"
             value={
-              walk.duration > 0
-                ? `${((walk.distance / 1000) / (walk.duration / 3600)).toFixed(1)}km/h`
+              summary.elapsedSeconds > 0
+                ? `${calculateSpeedKmh(summary.distanceMeters, summary.elapsedSeconds).toFixed(1)}km/h`
                 : '-'
             }
           />

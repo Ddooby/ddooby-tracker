@@ -10,6 +10,7 @@ import {
 import { useFocusEffect } from '@react-navigation/native';
 import { getWalks, deleteWalk } from '../storage/walkStorage';
 import { formatDistance, formatDuration } from '../utils/distance';
+import { getWalkSummary } from '../utils/track';
 
 export default function HistoryScreen({ navigation }) {
   const [walks, setWalks] = useState([]);
@@ -36,6 +37,7 @@ export default function HistoryScreen({ navigation }) {
 
   const renderItem = ({ item }) => {
     const date = new Date(item.date);
+    const summary = getWalkSummary(item);
     const dateStr = `${date.getFullYear()}.${String(date.getMonth() + 1).padStart(2, '0')}.${String(date.getDate()).padStart(2, '0')}`;
     const timeStr = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 
@@ -50,8 +52,8 @@ export default function HistoryScreen({ navigation }) {
           <Text style={styles.timeText}>{timeStr}</Text>
         </View>
         <View style={styles.cardRight}>
-          <Text style={styles.distanceText}>{formatDistance(item.distance)}</Text>
-          <Text style={styles.durationText}>{formatDuration(item.duration)}</Text>
+          <Text style={styles.distanceText}>{formatDistance(summary.distanceMeters)}</Text>
+          <Text style={styles.durationText}>{formatDuration(summary.elapsedSeconds)}</Text>
         </View>
       </TouchableOpacity>
     );

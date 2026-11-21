@@ -7,10 +7,18 @@ import {
   Alert,
   ActivityIndicator,
   Linking,
+  AppState,
 } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import useLocation from '../hooks/useLocation';
 import { calculateTotalDistance, formatDistance, formatDuration } from '../utils/distance';
+import {
+  filterValidSamples,
+  buildWalkRecord,
+  calculateElapsedSeconds,
+  calculateSpeedKmh,
+  SIGNAL_TIMEOUT_MS,
+} from '../utils/track';
 import { saveWalk, hasWalk } from '../storage/walkStorage';
 
 const INITIAL_REGION = {
@@ -25,14 +33,18 @@ export default function HomeScreen() {
   // 종료 처리(Alert 선택·'@active_walk' 정리 포함)가 끝날 때까지 재입력을 동기적으로 막는다.
   const busyRef = useRef(false);
   const notificationNoticeShownRef = useRef(false);
+  // 약한 신호 안내는 산책(startedAt)당 한 번만 띄운다.
+  const weakSignalShownForRef = useRef(null);
 
-  const [elapsed, setElapsed] = useState(0);
+  // 화면 시간 = now - startedAt. now는 표시용으로 1초마다 갱신하고, 잠금·백그라운드에서 돌아오면 즉시 갱신한다.
+  const [now, setNow] = useState(() => Date.now());
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const {
     currentLocation,
-    coords,
+    validCoords,
+    acquiring,
     isTracking,
     startedAt,
     restoring,
@@ -48,13 +60,18 @@ export default function HomeScreen() {
     setBusy(value);
   };
 
-  // 타이머 표시: 시작/복원 시점에 startedAt 기준 대략값으로 맞추고 이후 1초씩 증가.
-  // 정확한 시간 계산(시작/종료 시각 기반)은 TRK-02 범위.
+  // 시간의 진실의 원천은 startedAt(실 시각)이다. 아래 효과는 화면 갱신만 맡는다.
   useEffect(() => {
     if (!isTracking) return undefined;
-    setElapsed(startedAt ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : 0);
-    const id = setInterval(() => setElapsed((e) => e + 1), 1000);
-    return () => clearInterval(id);
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') setNow(Date.now());
+    });
+    return () => {
+      clearInterval(id);
+      sub.remove();
+    };
   }, [isTracking, startedAt]);
 
   useEffect(() => {
@@ -89,29 +106,25 @@ export default function HomeScreen() {
       return;
     }
     resetTracking();
-    setElapsed(0);
     setBusyFlag(false);
   };
 
   // 저장 → 임시 기록 정리. 저장이 실패하면 임시 기록을 보존하고 다시 안내한다.
-  const saveAndFinish = async (walk, duration, title) => {
+  const saveAndFinish = async (walk, endedAt, title) => {
     try {
       // 같은 id가 이미 이력에 있으면(저장 직후 종료된 경우) 다시 저장하지 않는다.
       if (!(await hasWalk(walk.id))) {
-        await saveWalk({
-          id: walk.id,
-          date: new Date().toISOString(),
-          coords: walk.coords,
-          distance: calculateTotalDistance(walk.coords),
-          duration,
-        });
+        // 좌표는 필터 없는 원본으로 저장하고, 거리·시간은 유효 샘플·실제 시작/종료 시각으로 계산한다.
+        await saveWalk(
+          buildWalkRecord({ id: walk.id, coords: walk.coords, startedAt: walk.startedAt, endedAt })
+        );
       }
     } catch (e) {
       Alert.alert(
         '저장하지 못했습니다',
         e?.message ?? '산책 기록을 저장하지 못했습니다.',
         [
-          { text: '다시 시도', onPress: () => saveAndFinish(walk, duration, title) },
+          { text: '다시 시도', onPress: () => saveAndFinish(walk, endedAt, title) },
           { text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) },
         ],
         { cancelable: false }
@@ -121,8 +134,8 @@ export default function HomeScreen() {
     await finishWalk(walk.id);
   };
 
-  // walk: { id, startedAt, coords }
-  const promptSave = async (walk, duration, title = '산책 종료') => {
+  // walk: { id, startedAt, coords(원본) }, endedAt: 종료 시각(ms)
+  const promptSave = async (walk, endedAt, title = '산책 종료') => {
     setBusyFlag(true);
     // 저장은 끝났는데 임시 기록만 남은 경우: 다시 묻지 않고 정리만 한다.
     try {
@@ -133,7 +146,7 @@ export default function HomeScreen() {
     } catch (e) {
       console.warn('[HomeScreen] hasWalk failed', e?.message ?? e);
     }
-    if (walk.coords.length < 2) {
+    if (filterValidSamples(walk.coords).length < 2) {
       Alert.alert(title, '경로가 너무 짧아 저장하지 않습니다.', [
         { text: '확인', onPress: () => finishWalk(walk.id) },
       ], { cancelable: false });
@@ -144,20 +157,21 @@ export default function HomeScreen() {
       title,
       '이번 산책을 저장할까요?',
       [
-        { text: '저장', onPress: () => saveAndFinish(walk, duration, title) },
+        { text: '저장', onPress: () => saveAndFinish(walk, endedAt, title) },
         { text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) },
       ],
       { cancelable: false }
     );
   };
 
-  const approxDuration = (walk) => {
+  // 중단된 산책의 종료 시각은 마지막으로 수집된 샘플 시각(없으면 시작 시각)
+  const interruptedEndedAt = (walk) => {
     const last = walk.coords[walk.coords.length - 1];
-    return last ? Math.max(0, Math.round((last.timestamp - walk.startedAt) / 1000)) : 0;
+    return last ? Math.max(walk.startedAt, last.timestamp) : walk.startedAt;
   };
 
   const promptInterrupted = (walk) =>
-    promptSave(walk, approxDuration(walk), '이전 산책이 중단되었습니다');
+    promptSave(walk, interruptedEndedAt(walk), '이전 산책이 중단되었습니다');
 
   // 서비스가 중단된 채 남은 이전 산책 → 저장/버리기 확인
   useEffect(() => {
@@ -209,9 +223,11 @@ export default function HomeScreen() {
     }
   };
 
-  const handleStop = async () => {
+  // discard=true: 저장 여부를 묻지 않고 기록을 버린다("신호가 약합니다" → 취소).
+  const handleStop = async (discard = false) => {
     if (busyRef.current) return;
     setBusyFlag(true);
+    const endedAt = Date.now(); // 사용자가 종료를 누른 시각 (중단 처리 지연과 무관)
 
     let result;
     try {
@@ -230,7 +246,7 @@ export default function HomeScreen() {
             text: '다시 시도',
             onPress: () => {
               setBusyFlag(false);
-              handleStop();
+              handleStop(discard);
             },
           },
         ],
@@ -239,24 +255,60 @@ export default function HomeScreen() {
       return;
     }
 
-    const walk = result.walk ?? { id: String(Date.now()), startedAt: Date.now(), coords: [] };
-    promptSave(walk, elapsed);
+    const walk = result.walk ?? { id: String(endedAt), startedAt: endedAt, coords: [] };
+    if (discard) {
+      finishWalk(walk.id);
+      return;
+    }
+    promptSave(walk, endedAt);
   };
 
-  const distance = calculateTotalDistance(coords);
-  const speed =
-    elapsed > 0 ? ((distance / 1000) / (elapsed / 3600)).toFixed(1) : '0.0';
+  // 시작 후 30초 안에 유효 샘플(accuracy ≤ 20m)이 없으면 안내한다. 그대로 시작하면 계속 기다리고
+  // (출발점·거리는 첫 유효 샘플부터), 취소하면 기록을 버린다.
+  useEffect(() => {
+    if (!acquiring || !startedAt || weakSignalShownForRef.current === startedAt) return undefined;
+    const showAlert = () => {
+      weakSignalShownForRef.current = startedAt;
+      Alert.alert(
+        '신호가 약합니다',
+        'GPS 신호가 약해 정확한 출발점을 잡지 못했습니다. 그대로 시작할까요? (정확한 위치가 잡힌 지점부터 기록됩니다)',
+        [
+          { text: '취소', style: 'destructive', onPress: () => handleStop(true) },
+          { text: '그대로 시작', style: 'default' },
+        ],
+        { cancelable: false }
+      );
+    };
+    const remaining = SIGNAL_TIMEOUT_MS - (Date.now() - startedAt);
+    if (remaining <= 0) {
+      showAlert();
+      return undefined;
+    }
+    const id = setTimeout(showAlert, remaining);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [acquiring, startedAt]);
+
+  const elapsed = isTracking && startedAt ? calculateElapsedSeconds(startedAt, now) : 0;
+  const distance = calculateTotalDistance(validCoords);
+  const speed = calculateSpeedKmh(distance, elapsed).toFixed(1);
 
   return (
     <View style={styles.container}>
       <MapView ref={mapRef} style={styles.map} initialRegion={INITIAL_REGION}>
-        {coords.length > 0 && (
-          <Marker coordinate={coords[0]} pinColor="blue" title="출발" />
+        {validCoords.length > 0 && (
+          <Marker coordinate={validCoords[0]} pinColor="blue" title="출발" />
         )}
-        {coords.length > 1 && (
-          <Polyline coordinates={coords} strokeColor="#22c55e" strokeWidth={4} />
+        {validCoords.length > 1 && (
+          <Polyline coordinates={validCoords} strokeColor="#22c55e" strokeWidth={4} />
         )}
       </MapView>
+
+      {acquiring && (
+        <View style={styles.acquiringBanner} pointerEvents="none">
+          <Text style={styles.acquiringText}>GPS 신호 찾는 중…</Text>
+        </View>
+      )}
 
       <View style={styles.statsBar}>
         <StatItem label="거리" value={formatDistance(distance)} />
@@ -270,7 +322,7 @@ export default function HomeScreen() {
         ) : isTracking ? (
           <TouchableOpacity
             style={[styles.btn, styles.stopBtn, busy && styles.btnDisabled]}
-            onPress={handleStop}
+            onPress={() => handleStop()}
             disabled={busy}
           >
             <Text style={styles.btnText}>산책 종료</Text>
@@ -301,6 +353,16 @@ function StatItem({ label, value }) {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   map: { flex: 1 },
+  acquiringBanner: {
+    position: 'absolute',
+    top: 16,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(17,24,39,0.85)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  acquiringText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   statsBar: {
     flexDirection: 'row',
     justifyContent: 'space-around',

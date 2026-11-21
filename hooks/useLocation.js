@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { PermissionsAndroid, Platform } from 'react-native';
 import * as Location from 'expo-location';
 import { LOCATION_TASK_NAME } from '../tasks/locationTask';
@@ -11,8 +11,8 @@ import {
   cleanupOrphanSamples,
   mergeSamples,
   newWalkId,
-  toSample,
 } from '../storage/activeWalk';
+import { filterValidSamples } from '../utils/track';
 
 const TASK_OPTIONS = {
   accuracy: Location.Accuracy.BestForNavigation,
@@ -110,10 +110,11 @@ async function cleanupService() {
 //   { ok: false, reason: 'pending-walk', walk }   // 서비스는 꺼졌는데 이전 기록이 남음
 //   { ok: false, reason: 'error', message }
 // stopTracking 반환:
-//   { ok: true, walk }  // walk: { id, startedAt, coords } | null
+//   { ok: true, walk }  // walk: { id, startedAt, coords(원본) } | null
 //   { ok: false, reason: 'stop-failed' | 'read-failed', message }
+// 노출 값: coords(원본), validCoords(유효 샘플), currentLocation(마지막 유효 샘플),
+//   acquiring(산책 중인데 아직 유효 샘플이 없음 = GPS 신호 찾는 중)
 export default function useLocation() {
-  const [currentLocation, setCurrentLocation] = useState(null);
   const [coords, setCoords] = useState([]);
   const [isTracking, setIsTracking] = useState(false);
   const [startedAt, setStartedAt] = useState(null);
@@ -136,8 +137,6 @@ export default function useLocation() {
     walkIdRef.current = walk.id;
     setCoords(walk.coords);
     setStartedAt(walk.startedAt);
-    const last = walk.coords[walk.coords.length - 1];
-    if (last) setCurrentLocation({ latitude: last.latitude, longitude: last.longitude });
   }, []);
 
   // 마운트: 기록이 있으면 복원, 구독 해제는 언마운트 시
@@ -146,8 +145,6 @@ export default function useLocation() {
     const unsubscribe = subscribeActiveWalk(({ id, samples }) => {
       if (!mountedRef.current || walkIdRef.current !== id) return;
       setCoords((prev) => mergeSamples(prev, samples));
-      const last = samples[samples.length - 1];
-      if (last) setCurrentLocation({ latitude: last.latitude, longitude: last.longitude });
     });
 
     runExclusive(async () => {
@@ -223,14 +220,12 @@ export default function useLocation() {
 
           const notificationsGranted = await ensureNotificationPermission();
 
-          const initial = await Location.getCurrentPositionAsync({
-            accuracy: Location.Accuracy.BestForNavigation,
-          });
-          const firstSample = toSample(initial);
-          // id는 위치 timestamp와 분리된 고유값, 첫 샘플은 별도 키라 startedAt 필터에서 제외된다
+          // 단일 getCurrentPosition 값을 출발점으로 쓰지 않는다(첫 값이 수 km 어긋난 사례, TRK-02).
+          // 서비스를 바로 시작하고 첫 유효 샘플(accuracy ≤ 20m)을 기다린다(acquiring).
+          // id는 위치 timestamp와 분리된 고유값
           const walk = { id: newWalkId(), startedAt: Date.now() };
-          await startActiveWalk(walk, [firstSample]);
-          applyWalk({ ...walk, coords: [firstSample] });
+          await startActiveWalk(walk, []);
+          applyWalk({ ...walk, coords: [] });
           try {
             await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, TASK_OPTIONS);
           } catch (e) {
@@ -274,14 +269,22 @@ export default function useLocation() {
   const resetTracking = useCallback(() => {
     walkIdRef.current = null;
     setCoords([]);
-    setCurrentLocation(null);
     setStartedAt(null);
     setInterruptedWalk(null);
   }, []);
 
+  const validCoords = useMemo(() => filterValidSamples(coords), [coords]);
+  const currentLocation = useMemo(() => {
+    const last = validCoords[validCoords.length - 1];
+    return last ? { latitude: last.latitude, longitude: last.longitude } : null;
+  }, [validCoords]);
+  const acquiring = isTracking && validCoords.length === 0;
+
   return {
     currentLocation,
     coords,
+    validCoords,
+    acquiring,
     isTracking,
     startedAt,
     restoring,
