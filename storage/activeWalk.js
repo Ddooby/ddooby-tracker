@@ -209,15 +209,27 @@ export async function beatIfServiceAlive({ walkId, isServiceRunning, hasPermissi
   return 'alive';
 }
 
+// 현재 진행 중 산책 메타의 id(없으면 null). 읽기 오류는 호출자에게 전달한다. (임시 기록 전체를 읽지 않는 가벼운 조회)
+export function peekActiveWalkId() {
+  return enqueue(async () => {
+    const meta = await readMeta();
+    return meta ? meta.id : null;
+  });
+}
+
 // 하트비트 한 주기. 반환:
 //   { status: 'alive' | 'unknown' }  기록했거나(alive) 조회가 불확실(unknown: 서비스는 그대로 두고 다음 주기에 재조회,
 //                                     반복 실패해도 서비스는 멈추지 않는다)
 //   { status: 'lost', walk }         서비스 중단·권한 없음이 확인됐고 임시 기록 읽기·서비스 정리까지 끝남(전환 완료)
 //   { status: 'lost-pending' }       lost는 확인됐지만 읽기가 실패 → 완료로 보지 않으며 호출자는 하트비트를
-//                                     멈추지 말고 다음 주기에 (lostPending=true로) 읽기·정리를 재시도한다
-// lost를 처음 확인한 순간 onLostDetected를 한 번 호출한다(호출자가 화면 수집 상태를 먼저 내리는 용도).
+//                                     멈추지 말고 다음 주기에 (lostPending=true, lostWalkId 고정)로 읽기·정리를 재시도한다
+//   { status: 'lost-stale' }         재시도 때 현재 메타가 없거나 id가 lostWalkId와 다름(이미 저장/버리기로 정리됐고
+//                                     다른 산책이 시작됐을 수 있음) → 정리·읽기 없이 pending만 해제하고 종료한다
+// lost를 처음 확인한 순간 onLostDetected(walkId)를 한 번 호출한다(호출자가 화면 수집 상태를 먼저 내리고 산책 id를 고정).
+// 재시도는 항상 그 id의 산책에만 작용한다(새 산책의 서비스를 멈추지 않는다).
 export async function heartbeatStep({
   lostPending = false,
+  lostWalkId,
   walkId,
   isServiceRunning,
   hasPermission,
@@ -225,10 +237,26 @@ export async function heartbeatStep({
   onLostDetected,
   now = Date.now,
 }) {
-  if (!lostPending) {
+  if (lostPending) {
+    let currentId;
+    try {
+      currentId = await peekActiveWalkId();
+    } catch {
+      return { status: 'lost-pending' };
+    }
+    if (currentId === null || currentId !== lostWalkId) return { status: 'lost-stale' };
+  } else {
     const status = await beatIfServiceAlive({ walkId, isServiceRunning, hasPermission, now });
     if (status !== 'lost') return { status };
-    onLostDetected?.();
+    let id = walkId;
+    if (id === undefined || id === null) {
+      try {
+        id = (await peekActiveWalkId()) ?? undefined;
+      } catch {
+        id = undefined;
+      }
+    }
+    onLostDetected?.(id);
   }
   try {
     await cleanupService(); // 남은 서비스·알림 정리(구현은 실패를 경고로만 남김)

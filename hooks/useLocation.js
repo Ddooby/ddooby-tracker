@@ -129,6 +129,7 @@ export default function useLocation() {
   const walkIdRef = useRef(null);
   const opChainRef = useRef(Promise.resolve());
   const lostPendingRef = useRef(false); // lost 확인 후 전환(임시 기록 읽기)이 끝나지 않은 상태
+  const lostWalkIdRef = useRef(null); // 그 전환이 속한 산책 id(재시도는 이 id에만 작용)
   const opPendingRef = useRef(0); // 진행 중인 시작·복원·종료 작업 수(하트비트는 이 동안 건너뛴다)
 
   // 시작·복원·종료를 한 번에 하나씩만 실행한다.
@@ -296,6 +297,12 @@ export default function useLocation() {
   //   | 'lost'(전환 완료: 중단된 산책 저장/버리기 경로). transition=false는 확인 후 기록만 한다(전환 없음).
   // lost를 확인하면 먼저 isTracking=false로 내려 화면 시간을 멈추고, 읽기·정리에 성공해야만 interruptedWalk를 설정한다.
   // 조회 오류(unknown)는 반복돼도 서비스를 멈추지 않는다(수집 지속이 안전한 기본값).
+  const clearLostPending = useCallback(() => {
+    lostPendingRef.current = false;
+    lostWalkIdRef.current = null;
+    setLostPending(false);
+  }, []);
+
   const heartbeat = useCallback(
     async ({ transition = true } = {}) => {
       if (opPendingRef.current > 0 || !mountedRef.current) return 'skipped';
@@ -312,33 +319,41 @@ export default function useLocation() {
         if (!mountedRef.current) return 'skipped';
         const result = await heartbeatStep({
           lostPending: lostPendingRef.current,
+          lostWalkId: lostWalkIdRef.current ?? undefined,
           walkId: walkIdRef.current ?? undefined,
           ...probes,
           cleanupService,
-          onLostDetected: () => {
+          onLostDetected: (id) => {
+            lostWalkIdRef.current = id ?? null; // 재시도를 이 산책 id로 한정
             lostPendingRef.current = true;
             setLostPending(true);
             setIsTracking(false); // 먼저 화면 수집 상태를 내려 시간을 멈춘다
           },
         });
+        if (result.status === 'lost-stale') {
+          // 그 산책의 임시 기록이 이미 정리됨(다른 산책이 시작됐을 수 있음): 정리 없이 pending만 해제한다.
+          clearLostPending();
+          return 'lost-stale';
+        }
         if (result.status !== 'lost') return result.status; // alive | unknown | lost-pending
         // 읽기·정리까지 성공했을 때만 전환을 완료한다.
-        lostPendingRef.current = false;
-        setLostPending(false);
+        clearLostPending();
         const { walk } = result;
         if (mountedRef.current && walk && walk.endedAt === undefined) setInterruptedWalk(walk);
         return 'lost';
       });
     },
-    [runExclusive]
+    [runExclusive, clearLostPending]
   );
 
   const resetTracking = useCallback(() => {
+    // 저장/버리기로 임시 기록을 정리했으면 중단 전환 상태도 모두 해제한다.
+    clearLostPending();
     walkIdRef.current = null;
     setCoords([]);
     setStartedAt(null);
     setInterruptedWalk(null);
-  }, []);
+  }, [clearLostPending]);
 
   const validCoords = useMemo(() => filterValidSamples(coords), [coords]);
   const currentLocation = useMemo(() => {

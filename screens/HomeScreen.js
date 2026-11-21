@@ -229,7 +229,8 @@ export default function HomeScreen() {
   }, [interruptedWalk]);
 
   const handleStart = async () => {
-    if (busyRef.current) return;
+    // 중단 전환(임시 기록 읽기)이 끝나기 전에는 새 산책을 시작하지 않는다.
+    if (busyRef.current || lostPending) return;
     setLoading(true);
     const result = await startTracking();
     setLoading(false);
@@ -395,9 +396,9 @@ export default function HomeScreen() {
           </TouchableOpacity>
         ) : (
           <TouchableOpacity
-            style={[styles.btn, styles.startBtn, busy && styles.btnDisabled]}
+            style={[styles.btn, styles.startBtn, (busy || lostPending) && styles.btnDisabled]}
             onPress={handleStart}
-            disabled={busy}
+            disabled={busy || lostPending}
           >
             <Text style={styles.btnText}>산책 시작</Text>
           </TouchableOpacity>
