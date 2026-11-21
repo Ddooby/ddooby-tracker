@@ -181,6 +181,25 @@ export function touchActiveWalkAlive(id, at) {
   });
 }
 
+// 하트비트: 서비스가 실행 중이고 foreground 권한이 있음을 확인한 뒤에만 lastAliveAt을 쓴다.
+// 서비스 중단·권한 없음·확인 오류면 쓰지 않고 'lost'를 반환한다(호출자가 하트비트를 멈추고 중단된 산책 경로로
+// 전환). 확인 뒤 Date.now()를 읽으므로 기록 시각은 확인 시점이다. 기록 오류는 무시한다('alive').
+export async function beatIfServiceAlive({ walkId, isServiceRunning, hasPermission, now = Date.now }) {
+  let alive = false;
+  try {
+    alive = Boolean(await isServiceRunning()) && Boolean(await hasPermission());
+  } catch {
+    alive = false;
+  }
+  if (!alive) return 'lost';
+  try {
+    await touchActiveWalkAlive(walkId, now());
+  } catch (e) {
+    console.warn('[activeWalk] heartbeat write failed', e?.message ?? e);
+  }
+  return 'alive';
+}
+
 // 서비스를 끝내 멈추지 못했을 때 영속화한 종료 시각을 지운다(수집이 계속되는 산책으로 되돌린다). 메타 전용.
 export function clearActiveWalkEnded(id) {
   return enqueue(async () => {

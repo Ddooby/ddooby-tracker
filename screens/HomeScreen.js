@@ -22,7 +22,6 @@ import {
   SIGNAL_TIMEOUT_MS,
 } from '../utils/track';
 import { saveWalk, hasWalk } from '../storage/walkStorage';
-import { touchActiveWalkAlive } from '../storage/activeWalk';
 
 const INITIAL_REGION = {
   latitude: 37.5665,
@@ -54,6 +53,7 @@ export default function HomeScreen() {
     isTracking,
     startedAt,
     restoring,
+    heartbeat,
     interruptedWalk,
     startTracking,
     stopTracking,
@@ -80,13 +80,20 @@ export default function HomeScreen() {
     };
   }, [isTracking, startedAt]);
 
-  // 산책 중 앱이 화면에 있는 동안 5초마다(그리고 화면 복귀 즉시) 메타에 lastAliveAt을 기록한다.
-  // 강제 종료로 종료 시각을 영속화하지 못해도 복원이 이 시각까지를 하한으로 쓴다. 백그라운드에서는 쓰지 않는다.
+  // 산책 중 앱이 화면에 있는 동안 ALIVE_HEARTBEAT_MS(목표 5초, 보장 아님)마다 그리고 화면 복귀 즉시, 서비스·권한을
+  // 확인한 뒤에만 메타에 lastAliveAt을 기록한다(hook.heartbeat). 서비스 중단·권한 없음·확인 오류면 기록하지 않고
+  // 수집 중 표시를 내려 "중단된 산책" 저장/버리기 경로로 전환한다. 강제 종료로 종료 시각을 영속화하지 못해도
+  // 복원이 마지막 샘플·마지막 정상 하트비트까지를 하한으로 쓴다(endedAtEstimated). 백그라운드에서는 쓰지 않는다.
   useEffect(() => {
     if (!isTracking) return undefined;
     let timer = null;
     const beat = () => {
-      touchActiveWalkAlive(undefined, Date.now()).catch(() => {});
+      heartbeat().then(
+        (status) => {
+          if (status === 'lost') stop();
+        },
+        () => {}
+      );
     };
     const start = () => {
       if (timer) return;
@@ -106,7 +113,7 @@ export default function HomeScreen() {
       stop();
       sub.remove();
     };
-  }, [isTracking]);
+  }, [isTracking, heartbeat]);
 
   useEffect(() => {
     if (currentLocation && mapRef.current) {
@@ -376,8 +383,8 @@ export default function HomeScreen() {
           <TouchableOpacity
             style={[styles.btn, styles.stopBtn, busy && styles.btnDisabled]}
             onPressIn={() => {
-              // 종료 요청 영속화 전 강제 종료에 대비해 손가락이 닿는 즉시 살아 있던 시각을 남긴다.
-              touchActiveWalkAlive(undefined, Date.now()).catch(() => {});
+              // 종료 요청 영속화 전 강제 종료에 대비해 손가락이 닿는 즉시(서비스·권한 확인 후) 시각을 남긴다.
+              heartbeat({ transition: false }).catch(() => {});
             }}
             onPress={() => handleStop()}
             disabled={busy}

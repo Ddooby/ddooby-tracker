@@ -5,7 +5,10 @@ export const MAX_ACCURACY_M = 20; // 보고 정확도가 이 값 이하인 샘�
 export const MAX_SPEED_KMH = 25; // 직전 유효 샘플 대비 이 속도를 넘는 이동은 GPS 오류로 본다
 export const SIGNAL_TIMEOUT_MS = 30000; // 시작 후 유효 샘플을 기다리는 시간(초과 시 안내)
 export const CALC_VERSION = 1;
-export const ALIVE_HEARTBEAT_MS = 5000; // 앱이 화면에 있고 산책 중일 때 lastAliveAt을 기록하는 간격(추정 종료 시각 오차 상한)
+// 앱이 화면에 있고 서비스·권한이 확인된 산책 중에 lastAliveAt을 기록하는 간격. 추정 종료 시각 오차의 "목표"는 5초이며
+// 보장값이 아니다(앱이 백그라운드·기록 지연이면 더 커질 수 있고, 그 경우에도 endedAtEstimated로 표시된다).
+// 목표를 맞추려고 간격은 3초로 둔다.
+export const ALIVE_HEARTBEAT_MS = 3000;
 export const QUALITY_NO_VALID_PATH = 'no-valid-path'; // 유효 샘플이 2개 미만이라 경로를 측정하지 못한 기록
 export const QUALITY_NO_LOCATION = 'no-location'; // 위치 샘플이 하나도 없는 기록(시간만 저장)
 

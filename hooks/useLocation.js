@@ -10,6 +10,7 @@ import {
   subscribeActiveWalk,
   cleanupOrphanSamples,
   finishCollection,
+  beatIfServiceAlive,
   mergeSamples,
   newWalkId,
 } from '../storage/activeWalk';
@@ -125,11 +126,21 @@ export default function useLocation() {
   const mountedRef = useRef(true);
   const walkIdRef = useRef(null);
   const opChainRef = useRef(Promise.resolve());
+  const opPendingRef = useRef(0); // 진행 중인 시작·복원·종료 작업 수(하트비트는 이 동안 건너뛴다)
 
   // 시작·복원·종료를 한 번에 하나씩만 실행한다.
   const runExclusive = useCallback((job) => {
+    opPendingRef.current += 1;
     const run = opChainRef.current.then(job, job);
     opChainRef.current = run.catch(() => {});
+    run.then(
+      () => {
+        opPendingRef.current -= 1;
+      },
+      () => {
+        opPendingRef.current -= 1;
+      }
+    );
     return run;
   }, []);
 
@@ -276,6 +287,39 @@ export default function useLocation() {
     [runExclusive]
   );
 
+  // 하트비트(HomeScreen이 5초 목표로 호출): 서비스 실행·foreground 권한을 확인한 뒤에만 lastAliveAt을 쓴다.
+  // 반환: 'alive' | 'skipped'(시작·복원·종료 작업 중) | 'lost'(서비스 중단·권한 없음·확인 오류).
+  // lost이고 transition=true면 수집 중 표시를 내리고 기존 "중단된 산책" 저장/버리기 경로로 보낸다
+  // (추정 종료 시각은 마지막 샘플·마지막 정상 하트비트 기준). transition=false는 기록 여부만 결정한다.
+  const heartbeat = useCallback(
+    async ({ transition = true } = {}) => {
+      if (opPendingRef.current > 0 || !mountedRef.current) return 'skipped';
+      const status = await beatIfServiceAlive({
+        walkId: walkIdRef.current ?? undefined,
+        isServiceRunning: () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME),
+        hasPermission: hasForegroundPermission,
+      });
+      if (status !== 'lost' || !transition) return status;
+      await runExclusive(async () => {
+        if (!mountedRef.current) return;
+        try {
+          const walk = await getActiveWalk();
+          await cleanupService(); // 남아 있을 수 있는 서비스·알림 정리(실패는 경고만)
+          if (walk && walk.endedAt === undefined) {
+            setIsTracking(false);
+            setInterruptedWalk(walk);
+          } else if (!walk) {
+            setIsTracking(false);
+          }
+        } catch (e) {
+          console.warn('[useLocation] lost-service transition failed', e?.message ?? e);
+        }
+      });
+      return 'lost';
+    },
+    [runExclusive]
+  );
+
   const resetTracking = useCallback(() => {
     walkIdRef.current = null;
     setCoords([]);
@@ -298,6 +342,7 @@ export default function useLocation() {
     isTracking,
     startedAt,
     restoring,
+    heartbeat,
     interruptedWalk,
     startTracking,
     stopTracking,
