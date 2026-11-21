@@ -70,16 +70,53 @@ export function buildWalkRecord({ id, coords, startedAt, endedAt }) {
   };
 }
 
-// 화면 표시용 요약. 새 필드(calcVersion)가 있으면 사용하고, 구 기록은 distance/duration 그대로(재계산 없음).
-export function getWalkSummary(walk) {
-  const isNew = walk && walk.calcVersion >= 1;
-  const distanceMeters = isNew ? walk.distanceMeters ?? walk.distance : walk.distance;
-  const elapsedSeconds = isNew ? walk.elapsedSeconds ?? walk.duration : walk.duration;
-  return { distanceMeters: distanceMeters ?? 0, elapsedSeconds: elapsedSeconds ?? 0, isNew: Boolean(isNew) };
+// calcVersion이 없는 구 기록이라도 모든 샘플에 timestamp·accuracy가 있으면 표시할 때만 다시 계산한다
+// (저장소 원본은 바꾸지 않는다). timestamp/accuracy가 없는 아주 예전 기록은 저장값 그대로 둔다.
+function hasMeasuredSamples(coords) {
+  return (
+    coords.length > 0 &&
+    coords.every((s) => s && typeof s.timestamp === 'number' && typeof s.accuracy === 'number')
+  );
 }
 
-// 지도에 그릴 좌표. 새 기록은 유효 샘플, 구 기록은 저장된 그대로.
+// 화면 표시용 요약(목록·상세 공용). 계산을 화면마다 두지 않고 여기 한 곳에서 한다.
+// - 새 기록(calcVersion ≥ 1): 저장된 distanceMeters/elapsedSeconds
+// - 구 기록 + timestamp·accuracy 있음: 유효 샘플 거리, 시간은 첫~마지막 샘플 timestamp 차(샘플 2개 미만이면 저장값)
+// - 그 외(아주 예전 기록): 저장된 distance/duration
+// recalculated=true면 저장값이 아닌 표시용 재계산 값이다.
+export function getWalkSummary(walk) {
+  const coords = Array.isArray(walk?.coords) ? walk.coords : [];
+  if (walk && walk.calcVersion >= 1) {
+    return {
+      distanceMeters: walk.distanceMeters ?? walk.distance ?? 0,
+      elapsedSeconds: walk.elapsedSeconds ?? walk.duration ?? 0,
+      isNew: true,
+      recalculated: false,
+    };
+  }
+  if (hasMeasuredSamples(coords)) {
+    const stamps = coords.map((s) => s.timestamp);
+    const spanSeconds =
+      coords.length >= 2 ? Math.round((Math.max(...stamps) - Math.min(...stamps)) / 1000) : null;
+    return {
+      distanceMeters: calculateValidDistance(coords),
+      elapsedSeconds: spanSeconds ?? walk?.duration ?? 0,
+      isNew: false,
+      recalculated: true,
+    };
+  }
+  return {
+    distanceMeters: walk?.distance ?? 0,
+    elapsedSeconds: walk?.duration ?? 0,
+    isNew: false,
+    recalculated: false,
+  };
+}
+
+// 지도에 그릴 좌표. 새 기록과 timestamp·accuracy 있는 구 기록은 유효 샘플, 그 외는 저장된 그대로.
 export function getWalkMapCoords(walk) {
   const coords = Array.isArray(walk?.coords) ? walk.coords : [];
-  return walk && walk.calcVersion >= 1 ? filterValidSamples(coords) : coords;
+  return (walk && walk.calcVersion >= 1) || hasMeasuredSamples(coords)
+    ? filterValidSamples(coords)
+    : coords;
 }
