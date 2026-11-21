@@ -9,7 +9,7 @@ import {
   whenActiveWalkIdle,
   subscribeActiveWalk,
   cleanupOrphanSamples,
-  markActiveWalkEnded,
+  finishCollection,
   mergeSamples,
   newWalkId,
 } from '../storage/activeWalk';
@@ -210,6 +210,11 @@ export default function useLocation() {
 
           const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
           const existing = await getActiveWalk();
+          if (running && existing && existing.endedAt !== undefined) {
+            // 종료 시각이 이미 기록된 산책에 서비스가 남아 있으면 이어 붙이지 않는다(오래된 종료 시각 방지).
+            await cleanupService();
+            return { ok: false, reason: 'pending-walk', walk: existing };
+          }
           if (running && existing) {
             // 이미 진행 중 → 새로 시작하지 않고 서비스만 다시 띄워 이어 붙인다
             applyWalk(existing);
@@ -249,30 +254,22 @@ export default function useLocation() {
 
   // 수집 중단을 확인한 뒤 임시 기록을 읽어 반환한다. 어느 단계든 실패하면 isTracking과 임시 기록을
   // 그대로 두고 실패를 반환한다. 재시도할 때 서비스가 이미 멈춰 있으면 중단은 건너뛰고 기록만 읽는다.
-  // endedAt: 사용자가 처음 종료를 요청한 시각(ms). 서비스 중단이 확정되면 읽기 전에 메타에 영속화하고,
-  // 이미 기록된 값이 있으면 그 값을 쓴다(재시도·재실행에서 종료 시각이 달라지지 않게).
+  // endedAt: 사용자가 처음 종료를 요청한 시각(ms). 서비스 중단·전체 샘플 읽기 '이전에' 메타에 영속화한다
+  // (첫 값 유지 → 재시도·재실행에서 종료 시각이 달라지지 않는다). 서비스를 끝내 멈추지 못하면(stop-failed)
+  // 그때만 지워 수집 지속 상태로 되돌린다. 서비스가 멈춘 뒤 읽기가 실패하면(read-failed) 종료 시각은 남기고
+  // 화면은 수집 중이 아닌 상태(isTracking=false)로 둔다 → 다음 시작/재시도가 같은 시각을 쓴다.
   const stopTracking = useCallback(
     (endedAt) =>
       runExclusive(async () => {
-        try {
-          if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME)) {
-            await stopAndVerify();
-          }
-        } catch (e) {
-          return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) };
-        }
-        try {
-          await whenActiveWalkIdle();
-          const walk = await getActiveWalk();
-          if (walk && typeof endedAt === 'number') {
-            const persisted = await markActiveWalkEnded(walk.id, endedAt);
-            walk.endedAt = persisted ?? endedAt;
-          }
-          if (mountedRef.current) setIsTracking(false);
-          return { ok: true, walk };
-        } catch (e) {
-          return { ok: false, reason: 'read-failed', message: e?.message ?? String(e) };
-        }
+        const result = await finishCollection({
+          walkId: walkIdRef.current ?? undefined,
+          endedAt,
+          isServiceRunning: () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME),
+          stopService: stopAndVerify,
+        });
+        // 서비스가 멈췄으면(성공, 또는 멈춘 뒤 읽기 실패) 수집 중처럼 보이지 않게 한다.
+        if ((result.ok || result.reason === 'read-failed') && mountedRef.current) setIsTracking(false);
+        return result;
       }),
     [runExclusive]
   );

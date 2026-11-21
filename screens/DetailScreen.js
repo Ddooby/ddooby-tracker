@@ -39,6 +39,9 @@ export default function DetailScreen({ route }) {
 
       <View style={styles.infoBox}>
         <Text style={styles.dateText}>{dateStr}</Text>
+        {walk.quality === 'no-location' && (
+          <Text style={styles.noticeText}>위치 기록 없음 (시간만 기록됨)</Text>
+        )}
         {walk.quality === 'no-valid-path' && (
           <Text style={styles.noticeText}>경로 측정 불가 (GPS 신호 약함 — 위치 원본과 시간만 기록됨)</Text>
         )}

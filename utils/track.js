@@ -6,6 +6,7 @@ export const MAX_SPEED_KMH = 25; // 직전 유효 샘플 대비 이 속도를 �
 export const SIGNAL_TIMEOUT_MS = 30000; // 시작 후 유효 샘플을 기다리는 시간(초과 시 안내)
 export const CALC_VERSION = 1;
 export const QUALITY_NO_VALID_PATH = 'no-valid-path'; // 유효 샘플이 2개 미만이라 경로를 측정하지 못한 기록
+export const QUALITY_NO_LOCATION = 'no-location'; // 위치 샘플이 하나도 없는 기록(시간만 저장)
 
 // 원본 샘플 배열 → 유효 샘플 배열(원본은 수정하지 않는다).
 // - timestamp 없는 샘플(구 스키마)은 accuracy·속도 판정 없이 그대로 통과한다.
@@ -66,11 +67,17 @@ export function resolveEndedAt(walk) {
 // 새 이력 레코드. coords는 필터 없는 원본, distance/duration은 이전 화면 호환용 별칭.
 // startedAt/endedAt은 ms 숫자.
 // endedAtEstimated=true: 종료 시각을 알 수 없어 마지막 샘플 시각으로 추정한 경우(하한).
-// 유효 샘플이 2개 미만이면 quality='no-valid-path'(거리 0)로 표시하고 원본·시간은 그대로 저장한다.
+// 유효 샘플이 2개 미만이면 quality='no-valid-path'(거리 0), 원본 샘플이 0개면 'no-location'으로 표시하고
+// 원본·시간은 그대로 저장한다.
 export function buildWalkRecord({ id, coords, startedAt, endedAt, endedAtEstimated = false }) {
   const distanceMeters = calculateValidDistance(coords);
   const elapsedSeconds = calculateElapsedSeconds(startedAt, endedAt);
-  const noValidPath = filterValidSamples(coords).length < 2;
+  const quality =
+    coords.length === 0
+      ? QUALITY_NO_LOCATION
+      : filterValidSamples(coords).length < 2
+        ? QUALITY_NO_VALID_PATH
+        : null;
   return {
     id,
     date: new Date(endedAt).toISOString(),
@@ -83,7 +90,7 @@ export function buildWalkRecord({ id, coords, startedAt, endedAt, endedAtEstimat
     distanceMeters,
     calcVersion: CALC_VERSION,
     ...(endedAtEstimated ? { endedAtEstimated: true } : {}),
-    ...(noValidPath ? { quality: QUALITY_NO_VALID_PATH } : {}),
+    ...(quality ? { quality } : {}),
   };
 }
 

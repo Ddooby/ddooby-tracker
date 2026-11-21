@@ -157,23 +157,17 @@ export default function HomeScreen() {
     } catch (e) {
       console.warn('[HomeScreen] hasWalk failed', e?.message ?? e);
     }
-    // 원본 샘플이 하나도 없으면 저장할 내용이 없으므로 버리기만 제공한다.
-    if (walk.coords.length === 0) {
-      Alert.alert(
-        title,
-        '기록된 위치가 없어 저장할 수 없습니다.',
-        [{ text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) }],
-        { cancelable: false }
-      );
-      return;
-    }
-    // 유효 경로가 2점 미만이어도 자동으로 지우지 않고 선택하게 한다(원본·시간은 그대로 저장, 거리 0).
-    const noValidPath = filterValidSamples(walk.coords).length < 2;
+    // 유효 경로가 2점 미만이거나 위치가 하나도 없어도 자동으로 지우지 않고 선택하게 한다
+    // (원본·시간은 그대로 저장, 거리 0, quality 표시).
+    const noLocation = walk.coords.length === 0;
+    const noValidPath = noLocation || filterValidSamples(walk.coords).length < 2;
     Alert.alert(
       title,
-      noValidPath
-        ? 'GPS 신호가 약해 경로를 측정하지 못했습니다. 저장하면 기록된 위치와 시간만 저장되고 거리는 0m입니다. 저장할까요?'
-        : '이번 산책을 저장할까요?',
+      noLocation
+        ? '위치가 기록되지 않았습니다. 저장하면 시간만 저장되고 거리는 0m입니다. 저장할까요?'
+        : noValidPath
+          ? 'GPS 신호가 약해 경로를 측정하지 못했습니다. 저장하면 기록된 위치와 시간만 저장되고 거리는 0m입니다. 저장할까요?'
+          : '이번 산책을 저장할까요?',
       [
         { text: '저장', onPress: () => saveAndFinish(walk, endedAt, title, estimated) },
         { text: '버리기', style: 'destructive', onPress: () => finishWalk(walk.id) },
@@ -263,7 +257,9 @@ export default function HomeScreen() {
             text: '취소',
             style: 'cancel',
             onPress: () => {
-              endRequestRef.current = null; // 종료를 취소했으니 다음 종료 요청은 새 시각을 쓴다
+              // 서비스가 계속 수집 중인 경우(stop-failed)만 종료 요청을 비운다. 이미 멈춘 뒤 읽기가 실패한
+              // 경우(read-failed)는 종료 시각(ref·메타)을 보존해 다음 시도가 같은 시각을 쓰게 한다.
+              if (result.reason === 'stop-failed') endRequestRef.current = null;
               setBusyFlag(false);
             },
           },

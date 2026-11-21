@@ -114,12 +114,13 @@ export function getActiveWalk() {
   });
 }
 
-// 종료 시각을 메타에 영속화한다(메타 전용, 샘플 키는 건드리지 않는다). 이미 기록돼 있으면 처음 값을 유지하고
-// 그 값을 반환한다. 메타가 없거나 id가 다르면 null. 쓰기 오류는 호출자에게 전달한다.
+// 종료 시각을 메타에 영속화한다(메타 전용, 샘플 키는 건드리지 않는다). 전체 샘플을 읽기 전에 호출한다.
+// 이미 기록돼 있으면 처음 값을 유지하고 그 값을 반환한다. 메타가 없거나 id(주어진 경우)가 다르면 null.
+// 쓰기 오류는 호출자에게 전달한다.
 export function markActiveWalkEnded(id, endedAt) {
   return enqueue(async () => {
     const meta = await readMeta();
-    if (!meta || meta.id !== id) return null;
+    if (!meta || (id !== undefined && id !== null && meta.id !== id)) return null;
     if (typeof meta.endedAt === 'number') return meta.endedAt;
     // 이전 형식 메타(인라인 coords/samples)도 잃지 않도록 메타 전체를 그대로 두고 endedAt만 더한다.
     await AsyncStorage.setItem(META_KEY, JSON.stringify({ ...meta, endedAt }));
@@ -163,6 +164,51 @@ export function appendActiveSamples(samples, batchId) {
     notify({ id: meta.id, samples: fresh });
     return meta;
   });
+}
+
+// 서비스를 끝내 멈추지 못했을 때 영속화한 종료 시각을 지운다(수집이 계속되는 산책으로 되돌린다). 메타 전용.
+export function clearActiveWalkEnded(id) {
+  return enqueue(async () => {
+    const meta = await readMeta();
+    if (!meta || (id !== undefined && id !== null && meta.id !== id)) return;
+    if (meta.endedAt === undefined) return;
+    const { endedAt, ...rest } = meta;
+    await AsyncStorage.setItem(META_KEY, JSON.stringify(rest));
+  });
+}
+
+// 산책 종료 시퀀스(서비스 중단 + 임시 기록 읽기). 위치 라이브러리와 분리하려고 서비스 제어는 주입받는다.
+// 1) 종료 시각을 메타에 먼저 영속화(첫 값 유지) → 2) 서비스 중단(stopService, 실패 시 영속화한 종료 시각을
+// 지우고 수집 지속) → 3) 임시 기록 읽기(실패해도 종료 시각은 메타에 남는다).
+// 반환: { ok: true, walk }(walk.endedAt = 영속 값) | { ok: false, reason: 'stop-failed' | 'read-failed', message }
+//   read-failed는 서비스가 이미 멈춘 상태다.
+export async function finishCollection({ walkId, endedAt, isServiceRunning, stopService }) {
+  let persisted;
+  if (typeof endedAt === 'number') {
+    try {
+      persisted = (await markActiveWalkEnded(walkId, endedAt)) ?? undefined;
+    } catch (e) {
+      return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) }; // 아직 수집 중
+    }
+  }
+  try {
+    if (await isServiceRunning()) await stopService();
+  } catch (e) {
+    try {
+      await clearActiveWalkEnded(walkId);
+    } catch (clearError) {
+      console.warn('[activeWalk] clear endedAt failed', clearError?.message ?? clearError);
+    }
+    return { ok: false, reason: 'stop-failed', message: e?.message ?? String(e) };
+  }
+  try {
+    await whenActiveWalkIdle();
+    const walk = await getActiveWalk();
+    if (walk && persisted !== undefined) walk.endedAt = walk.endedAt ?? persisted;
+    return { ok: true, walk };
+  } catch (e) {
+    return { ok: false, reason: 'read-failed', message: e?.message ?? String(e) };
+  }
 }
 
 // 메타가 없거나 id가 다른 샘플 키(고아)를 지운다. 앱 시작 복원 때 호출한다.
