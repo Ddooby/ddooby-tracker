@@ -11,11 +11,14 @@ import {
 } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import useLocation from '../hooks/useLocation';
-import { calculateTotalDistance, formatDistance, formatDuration } from '../utils/distance';
+import { formatDistance, formatDuration } from '../utils/distance';
 import {
-  filterValidSamples,
+  hasValidPath,
+  normalizePauses,
+  sumSegmentsDistance,
   buildWalkRecord,
   calculateElapsedSeconds,
+  calculateMovingSeconds,
   calculateSpeedKmh,
   resolveEndedAt,
   ALIVE_HEARTBEAT_MS,
@@ -48,15 +51,22 @@ export default function HomeScreen() {
 
   const {
     currentLocation,
+    heading,
+    segments,
     validCoords,
     acquiring,
     isTracking,
+    isPaused,
+    pausedAt,
+    pauses,
     startedAt,
     restoring,
     heartbeat,
     lostPending,
     interruptedWalk,
     startTracking,
+    pauseTracking,
+    resumeTracking,
     stopTracking,
     resetTracking,
     clearActiveWalk,
@@ -88,6 +98,8 @@ export default function HomeScreen() {
   useEffect(() => {
     // lost 전환의 읽기가 실패해 재시도 중(lostPending)이면 isTracking이 꺼져 있어도 하트비트를 계속 돈다.
     if (!isTracking && !lostPending) return undefined;
+    // 일시정지 중에는 서비스가 꺼져 있는 것이 정상이므로 하트비트를 돌리지 않는다(lost로 오판 방지).
+    if (isPaused && !lostPending) return undefined;
     let timer = null;
     const beat = () => {
       heartbeat().then(
@@ -115,7 +127,7 @@ export default function HomeScreen() {
       stop();
       sub.remove();
     };
-  }, [isTracking, lostPending, heartbeat]);
+  }, [isTracking, isPaused, lostPending, heartbeat]);
 
   useEffect(() => {
     if (currentLocation && mapRef.current) {
@@ -166,6 +178,8 @@ export default function HomeScreen() {
             startedAt: walk.startedAt,
             endedAt,
             endedAtEstimated: estimated,
+            pauses: walk.pauses,
+            pausedAt: walk.pausedAt, // 일시정지 상태로 종료했으면 종료 시각까지 일시정지로 본다
           })
         );
       }
@@ -184,7 +198,7 @@ export default function HomeScreen() {
     await finishWalk(walk.id);
   };
 
-  // walk: { id, startedAt, coords(원본) }, endedAt: 종료 시각(ms), estimated: 마지막 샘플 시각으로 추정한 값인지
+  // walk: { id, startedAt, coords(원본), pauses?, pausedAt? }, endedAt: 종료 시각(ms), estimated: 마지막 샘플 시각으로 추정한 값인지
   const promptSave = async (walk, endedAt, title = '산책 종료', estimated = false) => {
     setBusyFlag(true);
     // 저장은 끝났는데 임시 기록만 남은 경우: 다시 묻지 않고 정리만 한다.
@@ -199,7 +213,8 @@ export default function HomeScreen() {
     // 유효 경로가 2점 미만이거나 위치가 하나도 없어도 자동으로 지우지 않고 선택하게 한다
     // (원본·시간은 그대로 저장, 거리 0, quality 표시).
     const noLocation = walk.coords.length === 0;
-    const noValidPath = noLocation || filterValidSamples(walk.coords).length < 2;
+    const noValidPath =
+      noLocation || !hasValidPath(walk.coords, normalizePauses(walk.pauses, walk.pausedAt, endedAt));
     Alert.alert(
       title,
       noLocation
@@ -270,6 +285,63 @@ export default function HomeScreen() {
       promptInterrupted(result.walk);
     } else {
       Alert.alert('산책을 시작하지 못했습니다', result.message);
+    }
+  };
+
+  // 일시정지/다시 시작: 종료·시작과 같은 busy 가드를 쓰고, 실패하면 상태를 그대로 둔 채 안내한다.
+  const handlePause = async () => {
+    if (busyRef.current || lostPending || !isTracking || isPaused) return;
+    setBusyFlag(true);
+    let result;
+    try {
+      result = await pauseTracking(Date.now());
+    } catch (e) {
+      result = { ok: false, reason: 'pause-failed', message: e?.message ?? String(e) };
+    }
+    setBusyFlag(false);
+    if (!result.ok) {
+      if (result.reason !== 'invalid') {
+        Alert.alert('일시정지하지 못했습니다', result.message ?? '위치 수집을 멈추지 못했습니다.');
+      }
+      return;
+    }
+    if (result.unconfirmed) {
+      Alert.alert(
+        '일시정지했습니다',
+        '위치 수집이 멈췄는지 확인하지 못했습니다. 일시정지 중에 들어온 위치는 거리에 반영되지 않으며, 다시 시작하거나 종료할 때 정리됩니다.'
+      );
+    }
+  };
+
+  const handleResume = async () => {
+    if (busyRef.current || lostPending || !isTracking || !isPaused) return;
+    setBusyFlag(true);
+    let result;
+    try {
+      result = await resumeTracking(Date.now());
+    } catch (e) {
+      result = { ok: false, reason: 'resume-failed', message: e?.message ?? String(e) };
+    }
+    setBusyFlag(false);
+    if (result.ok) return;
+    if (result.reason === 'permission') {
+      Alert.alert(
+        '위치 권한이 필요합니다',
+        result.canAskAgain
+          ? '산책을 이어 기록하려면 위치 권한을 허용해주세요.'
+          : '설정에서 위치 권한을 "앱 사용 중 허용"으로 바꿔주세요.',
+        result.canAskAgain
+          ? [
+              { text: '취소', style: 'cancel' },
+              { text: '다시 시도', onPress: handleResume },
+            ]
+          : [
+              { text: '취소', style: 'cancel' },
+              { text: '설정 열기', onPress: () => Linking.openSettings() },
+            ]
+      );
+    } else if (result.reason !== 'invalid') {
+      Alert.alert('다시 시작하지 못했습니다', result.message ?? '위치 수집을 다시 시작하지 못했습니다. 일시정지 상태로 유지됩니다.');
     }
   };
 
@@ -353,8 +425,12 @@ export default function HomeScreen() {
   }, [acquiring, startedAt]);
 
   const elapsed = isTracking && startedAt ? calculateElapsedSeconds(startedAt, now) : 0;
-  const distance = calculateTotalDistance(validCoords);
-  const speed = calculateSpeedKmh(distance, elapsed).toFixed(1);
+  // 거리는 일시정지 경계로 나눈 구간별 합(경계를 넘어 잇지 않는다). 평균 속도는 이동시간 기준.
+  const distance = sumSegmentsDistance(segments);
+  const moving =
+    isTracking && startedAt ? calculateMovingSeconds(startedAt, now, pauses, pausedAt ?? undefined) : 0;
+  const speed = calculateSpeedKmh(distance, moving).toFixed(1);
+  const hasPause = isPaused || pauses.length > 0;
 
   return (
     <View style={styles.container}>
@@ -362,8 +438,14 @@ export default function HomeScreen() {
         {validCoords.length > 0 && (
           <Marker coordinate={validCoords[0]} pinColor="blue" title="출발" />
         )}
-        {validCoords.length > 1 && (
-          <Polyline coordinates={validCoords} strokeColor="#22c55e" strokeWidth={4} />
+        {segments.map(
+          (seg, i) =>
+            seg.length > 1 && (
+              <Polyline key={`seg-${i}`} coordinates={seg} strokeColor="#22c55e" strokeWidth={4} />
+            )
+        )}
+        {isTracking && currentLocation && (
+          <CurrentLocationMarker coordinate={currentLocation} heading={heading} />
         )}
       </MapView>
 
@@ -373,9 +455,16 @@ export default function HomeScreen() {
         </View>
       )}
 
+      {isPaused && (
+        <View style={styles.acquiringBanner} pointerEvents="none">
+          <Text style={styles.acquiringText}>일시정지됨 · 위치를 기록하지 않습니다</Text>
+        </View>
+      )}
+
       <View style={styles.statsBar}>
         <StatItem label="거리" value={formatDistance(distance)} />
         <StatItem label="시간" value={formatDuration(elapsed)} />
+        {hasPause && <StatItem label="이동" value={formatDuration(moving)} />}
         <StatItem label="속도" value={`${speed}km/h`} />
       </View>
 
@@ -383,17 +472,32 @@ export default function HomeScreen() {
         {loading || restoring ? (
           <ActivityIndicator size="large" color="#22c55e" />
         ) : isTracking ? (
-          <TouchableOpacity
-            style={[styles.btn, styles.stopBtn, busy && styles.btnDisabled]}
-            onPressIn={() => {
-              // 종료 요청 영속화 전 강제 종료에 대비해 손가락이 닿는 즉시(서비스·권한 확인 후) 시각을 남긴다.
-              heartbeat({ transition: false }).catch(() => {});
-            }}
-            onPress={() => handleStop()}
-            disabled={busy}
-          >
-            <Text style={styles.btnText}>산책 종료</Text>
-          </TouchableOpacity>
+          <View style={styles.btnRow}>
+            <TouchableOpacity
+              style={[
+                styles.btn,
+                styles.btnHalf,
+                isPaused ? styles.startBtn : styles.pauseBtn,
+                (busy || lostPending) && styles.btnDisabled,
+              ]}
+              onPress={isPaused ? handleResume : handlePause}
+              disabled={busy || lostPending}
+            >
+              <Text style={styles.btnText}>{isPaused ? '다시 시작' : '일시정지'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.btn, styles.btnHalf, styles.stopBtn, busy && styles.btnDisabled]}
+              onPressIn={() => {
+                // 종료 요청 영속화 전 강제 종료에 대비해 손가락이 닿는 즉시(서비스·권한 확인 후) 시각을 남긴다.
+                // 일시정지 중에는 서비스가 꺼져 있는 것이 정상이라 기록하지 않는다(hook이 'paused'로 건너뜀).
+                heartbeat({ transition: false }).catch(() => {});
+              }}
+              onPress={() => handleStop()}
+              disabled={busy}
+            >
+              <Text style={styles.btnText}>산책 종료</Text>
+            </TouchableOpacity>
+          </View>
         ) : (
           <TouchableOpacity
             style={[styles.btn, styles.startBtn, (busy || lostPending) && styles.btnDisabled]}
@@ -405,6 +509,33 @@ export default function HomeScreen() {
         )}
       </View>
     </View>
+  );
+}
+
+// 현재 위치 표시: 파란 원형 점 + (이동 방향이 있으면) 방향 화살표. 방향은 마커 회전(flat)으로 표현한다.
+// 안드로이드 커스텀 마커는 내용이 바뀐 직후에만 잠깐 뷰 변경을 추적하게 해 성능을 지킨다.
+function CurrentLocationMarker({ coordinate, heading }) {
+  const hasHeading = typeof heading === 'number';
+  const [track, setTrack] = useState(true);
+  useEffect(() => {
+    setTrack(true);
+    const id = setTimeout(() => setTrack(false), 400);
+    return () => clearTimeout(id);
+  }, [hasHeading]);
+  return (
+    <Marker
+      coordinate={coordinate}
+      anchor={{ x: 0.5, y: 0.5 }}
+      flat
+      rotation={hasHeading ? heading : 0}
+      tracksViewChanges={track}
+      zIndex={2}
+    >
+      <View style={styles.locWrap}>
+        {hasHeading && <View style={styles.locArrow} />}
+        <View style={styles.locDot} />
+      </View>
+    </Marker>
   );
 }
 
@@ -453,6 +584,30 @@ const styles = StyleSheet.create({
   },
   startBtn: { backgroundColor: '#22c55e' },
   stopBtn: { backgroundColor: '#ef4444' },
+  pauseBtn: { backgroundColor: '#f59e0b' },
+  btnRow: { flexDirection: 'row', gap: 12 },
+  btnHalf: { flex: 1 },
   btnDisabled: { opacity: 0.5 },
+  locWrap: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
+  locDot: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#2563eb',
+    borderWidth: 3,
+    borderColor: '#fff',
+  },
+  locArrow: {
+    position: 'absolute',
+    top: 1,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 7,
+    borderRightWidth: 7,
+    borderBottomWidth: 12,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#2563eb',
+  },
   btnText: { color: '#fff', fontSize: 18, fontWeight: '700' },
 });

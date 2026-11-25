@@ -2,14 +2,17 @@ import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import MapView, { Polyline, Marker } from 'react-native-maps';
 import { formatDistance, formatDuration } from '../utils/distance';
-import { getWalkSummary, getWalkMapCoords, calculateSpeedKmh } from '../utils/track';
+import { getWalkSummary, getWalkMapSegments, calculateSpeedKmh } from '../utils/track';
 
 export default function DetailScreen({ route }) {
   const { walk } = route.params;
 
   // 새 기록은 유효 샘플로, 구 기록은 저장된 좌표 그대로 그린다. 거리·시간도 새 필드가 있으면 그것을 쓴다.
   const summary = getWalkSummary(walk);
-  const coords = getWalkMapCoords(walk);
+  // 일시정지 경계로 나뉜 구간별 좌표(구간 사이는 잇지 않는다). 마커는 이어 붙인 목록의 처음·끝.
+  const segments = getWalkMapSegments(walk);
+  const coords = segments.flat();
+  const hasPause = Array.isArray(walk.pauses) && walk.pauses.length > 0;
   const midIndex = Math.floor(coords.length / 2);
   const center = coords[midIndex] || coords[0] || walk.coords?.[0] || { latitude: 37.5665, longitude: 126.978 };
 
@@ -32,8 +35,11 @@ export default function DetailScreen({ route }) {
         {coords.length > 0 && (
           <Marker coordinate={coords[coords.length - 1]} pinColor="red" title="도착" />
         )}
-        {coords.length > 1 && (
-          <Polyline coordinates={coords} strokeColor="#22c55e" strokeWidth={4} />
+        {segments.map(
+          (seg, i) =>
+            seg.length > 1 && (
+              <Polyline key={`seg-${i}`} coordinates={seg} strokeColor="#22c55e" strokeWidth={4} />
+            )
         )}
       </MapView>
 
@@ -52,12 +58,18 @@ export default function DetailScreen({ route }) {
           <StatItem label="거리" value={formatDistance(summary.distanceMeters)} />
           <View style={styles.divider} />
           <StatItem label="시간" value={formatDuration(summary.elapsedSeconds)} />
+          {hasPause && (
+            <>
+              <View style={styles.divider} />
+              <StatItem label="이동" value={formatDuration(summary.movingSeconds)} />
+            </>
+          )}
           <View style={styles.divider} />
           <StatItem
             label="평균속도"
             value={
-              summary.elapsedSeconds > 0
-                ? `${calculateSpeedKmh(summary.distanceMeters, summary.elapsedSeconds).toFixed(1)}km/h`
+              summary.movingSeconds > 0
+                ? `${calculateSpeedKmh(summary.distanceMeters, summary.movingSeconds).toFixed(1)}km/h`
                 : '-'
             }
           />
