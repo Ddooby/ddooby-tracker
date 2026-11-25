@@ -57,6 +57,7 @@ export default function HomeScreen() {
     acquiring,
     isTracking,
     isPaused,
+    pausePending,
     pausedAt,
     pauses,
     startedAt,
@@ -98,8 +99,9 @@ export default function HomeScreen() {
   useEffect(() => {
     // lost 전환의 읽기가 실패해 재시도 중(lostPending)이면 isTracking이 꺼져 있어도 하트비트를 계속 돈다.
     if (!isTracking && !lostPending) return undefined;
-    // 일시정지 중에는 서비스가 꺼져 있는 것이 정상이므로 하트비트를 돌리지 않는다(lost로 오판 방지).
-    if (isPaused && !lostPending) return undefined;
+    // 일시정지 중에는 서비스가 꺼져 있는 것이 정상이므로 서비스 확인(lost 판정)을 하지 않는다. 다만 일시정지를 요청한 뒤
+    // 중단을 아직 확인하지 못한 동안(pausePending)은 하트비트가 같은 산책 id로 재조회·중단을 재시도한다(사용자 입력 불필요).
+    if (isPaused && !pausePending && !lostPending) return undefined;
     let timer = null;
     const beat = () => {
       heartbeat().then(
@@ -127,7 +129,7 @@ export default function HomeScreen() {
       stop();
       sub.remove();
     };
-  }, [isTracking, isPaused, lostPending, heartbeat]);
+  }, [isTracking, isPaused, pausePending, lostPending, heartbeat]);
 
   useEffect(() => {
     if (currentLocation && mapRef.current) {
@@ -299,17 +301,14 @@ export default function HomeScreen() {
       result = { ok: false, reason: 'pause-failed', message: e?.message ?? String(e) };
     }
     setBusyFlag(false);
-    if (!result.ok) {
-      if (result.reason !== 'invalid') {
-        Alert.alert('일시정지하지 못했습니다', result.message ?? '위치 수집을 멈추지 못했습니다.');
-      }
-      return;
-    }
-    if (result.unconfirmed) {
+    if (result.ok) return; // 중단 확인 전이면 배너가 '일시정지 확인 중'으로 표시되고 하트비트가 확인될 때까지 재시도한다
+    if (result.reason === 'rollback-failed') {
       Alert.alert(
-        '일시정지했습니다',
-        '위치 수집이 멈췄는지 확인하지 못했습니다. 일시정지 중에 들어온 위치는 거리에 반영되지 않으며, 다시 시작하거나 종료할 때 정리됩니다.'
+        '일시정지 상태를 확인하는 중입니다',
+        '위치 수집을 멈추지 못했고 되돌리는 저장도 실패했습니다. 멈춘 것이 확인될 때까지 자동으로 다시 시도합니다.'
       );
+    } else if (result.reason !== 'invalid') {
+      Alert.alert('일시정지하지 못했습니다', result.message ?? '위치 수집을 멈추지 못했습니다.');
     }
   };
 
@@ -341,7 +340,13 @@ export default function HomeScreen() {
             ]
       );
     } else if (result.reason !== 'invalid') {
-      Alert.alert('다시 시작하지 못했습니다', result.message ?? '위치 수집을 다시 시작하지 못했습니다. 일시정지 상태로 유지됩니다.');
+      Alert.alert(
+        '다시 시작하지 못했습니다',
+        (result.message ?? '위치 수집을 다시 시작하지 못했습니다.') +
+          (result.stopStatus && result.stopStatus !== 'stopped'
+            ? ' 위치 수집이 멈췄는지 확인하는 중이며 자동으로 다시 시도합니다.'
+            : ' 일시정지 상태로 유지됩니다.')
+      );
     }
   };
 
@@ -457,7 +462,9 @@ export default function HomeScreen() {
 
       {isPaused && (
         <View style={styles.acquiringBanner} pointerEvents="none">
-          <Text style={styles.acquiringText}>일시정지됨 · 위치를 기록하지 않습니다</Text>
+          <Text style={styles.acquiringText}>
+            {pausePending ? '일시정지 확인 중…' : '일시정지됨 · 위치를 기록하지 않습니다'}
+          </Text>
         </View>
       )}
 

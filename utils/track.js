@@ -179,7 +179,12 @@ export function resolveEndedAt(walk) {
   const alive = typeof walk.lastAliveAt === 'number' ? walk.lastAliveAt : walk.startedAt;
   // 일시정지 중이던 산책이면 일시정지 시작 시각도 하한에 포함한다(그 뒤는 일시정지 시간으로 본다).
   const pausedAt = typeof walk.pausedAt === 'number' ? walk.pausedAt : walk.startedAt;
-  return { endedAt: Math.max(walk.startedAt, lastTs, alive, pausedAt), estimated: true };
+  // 이미 끝난 일시정지(재개 이벤트)의 마지막 end도 하한에 포함한다: 재개 직후 새 샘플·하트비트 전에 중단돼도
+  // 추정 종료 시각이 영속화된 재개 시각보다 과거로 돌아가지 않는다.
+  const lastResume = Array.isArray(walk.pauses)
+    ? walk.pauses.reduce((max, p) => (p && typeof p.end === 'number' && p.end > max ? p.end : max), walk.startedAt)
+    : walk.startedAt;
+  return { endedAt: Math.max(walk.startedAt, lastTs, alive, pausedAt, lastResume), estimated: true };
 }
 
 // 새 이력 레코드. coords는 필터 없는 원본, distance/duration은 이전 화면 호환용 별칭.

@@ -16,6 +16,8 @@ import {
   newWalkId,
   pauseCollection,
   resumeCollection,
+  retryPauseStop,
+  ensureServiceStopped,
 } from '../storage/activeWalk';
 import { filterValidSegments, normalizePauses, calculateHeading } from '../utils/track';
 
@@ -92,21 +94,31 @@ async function stopAndVerify() {
 
 // 포그라운드 서비스(알림)를 새로 띄운다: 기존 task 정리(실패 무시) 후 같은 옵션으로 재시작.
 async function restartService() {
+  // 등록돼 있지 않은 task에 stop을 부르면 예외(경고)만 나므로 실행 중이거나 조회에 실패했을 때만 정리한다.
+  let needStop = true;
   try {
-    await stopAndVerify();
-  } catch (e) {
-    console.warn('[useLocation] stop before restart failed', e?.message ?? e);
+    needStop = Boolean(await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME));
+  } catch {
+    needStop = true;
+  }
+  if (needStop) {
+    try {
+      await stopAndVerify();
+    } catch (e) {
+      console.warn('[useLocation] stop before restart failed', e?.message ?? e);
+    }
   }
   await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, TASK_OPTIONS);
 }
 
-// 서비스 정리(실패해도 진행). 정리 결과는 경고 로그로만 남긴다.
+const isServiceRunning = () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+
+// 서비스 정리(실패해도 진행). 조회 예외여도 중단을 시도하고, 반환값으로 "중단 확인 완료" 여부를 알린다
+// (true: 멈춘 것을 확인함, false: 실행 중이거나 확인하지 못함 → 호출자가 재시도할 수 있다).
 async function cleanupService() {
-  try {
-    await stopAndVerify();
-  } catch (e) {
-    console.warn('[useLocation] service cleanup failed', e?.message ?? e);
-  }
+  const r = await ensureServiceStopped({ isServiceRunning, stopService: stopAndVerify });
+  if (r.status !== 'stopped') console.warn('[useLocation] service cleanup not confirmed', r.status, r.message);
+  return r.status === 'stopped';
 }
 
 // startTracking 반환:
@@ -118,15 +130,18 @@ async function cleanupService() {
 //   { ok: true, walk }  // walk: { id, startedAt, endedAt, coords(원본) } | null (endedAt: 영속화된 종료 시각)
 //   { ok: false, reason: 'stop-failed' | 'read-failed', message }
 // pauseTracking(at) 반환:
-//   { ok: true, unconfirmed }  // unconfirmed: 일시정지는 기록했으나 위치 수집 중단을 확인하지 못함
-//   { ok: false, reason: 'invalid' | 'busy' | 'pause-failed' | 'stop-failed', message? }
+//   { ok: true, confirmed }  // confirmed=false: 일시정지 요청은 기록했으나 위치 수집 중단을 아직 확인하지 못함
+//                            // (pausePending=true, 하트비트 주기마다 같은 산책 id로 재조회·중단 재시도)
+//   { ok: false, reason: 'invalid' | 'pause-failed' | 'stop-failed' | 'rollback-failed', message? }
+//     rollback-failed: 계속 실행 중이고 일시정지 요청 롤백도 실패 → 메타에 맞춰 pausePending으로 표시
 // resumeTracking(at) 반환:
 //   { ok: true }
 //   { ok: false, reason: 'permission', canAskAgain }
-//   { ok: false, reason: 'invalid' | 'start-failed' | 'resume-failed', message? }  // 일시정지 상태 유지
+//   { ok: false, reason: 'invalid' | 'start-failed' | 'resume-failed', message?, stopStatus? }  // 일시정지 상태 유지
+//     stopStatus가 'stopped'가 아니면(롤백 중단 미확인) pausePending으로 두고 재시도
 // 노출 값: coords(원본), segments(일시정지 경계로 나눈 구간별 유효 샘플), validCoords(segments를 이은 목록),
 //   currentLocation(마지막 유효 샘플), heading(진행 방향 도 | null), acquiring(산책 중인데 아직 유효 샘플이
-//   없음 = GPS 신호 찾는 중), isPaused/pausedAt/pauses(일시정지 상태)
+//   없음 = GPS 신호 찾는 중), isPaused/pausedAt/pauses(일시정지 상태), pausePending(일시정지 요청 후 중단 확인 전)
 export default function useLocation() {
   const [coords, setCoords] = useState([]);
   const [isTracking, setIsTracking] = useState(false);
@@ -140,6 +155,8 @@ export default function useLocation() {
   const [interruptedWalk, setInterruptedWalk] = useState(null);
   const mountedRef = useRef(true);
   const walkIdRef = useRef(null);
+  const [pauseConfirmed, setPauseConfirmed] = useState(true); // 일시정지 중단 확인 완료 여부(요청과 구분)
+  const pauseConfirmedRef = useRef(true);
   const pausedRef = useRef(false); // 일시정지 중(서비스가 꺼져 있는 것이 정상): 하트비트는 서비스를 확인하지 않는다
   const opChainRef = useRef(Promise.resolve());
   const lostPendingRef = useRef(false); // lost 확인 후 전환(임시 기록 읽기)이 끝나지 않은 상태
@@ -160,6 +177,11 @@ export default function useLocation() {
       }
     );
     return run;
+  }, []);
+
+  const setConfirmed = useCallback((value) => {
+    pauseConfirmedRef.current = value;
+    setPauseConfirmed(value);
   }, []);
 
   const applyWalk = useCallback((walk) => {
@@ -195,8 +217,10 @@ export default function useLocation() {
         if (walk && walk.endedAt === undefined && walk.pausedAt !== undefined) {
           // 일시정지 중에 프로세스가 종료됐다: 일시정지 상태로 복원한다. 서비스를 다시 시작하지 않고(일시정지 중에는
           // 꺼져 있는 것이 정상), 남아 있으면 정리한다. 하트비트는 일시정지 중 서비스를 확인하지 않는다.
-          if (running) await cleanupService();
+          const stopped = await cleanupService(); // 조회 예외여도 중단을 시도하고 결과를 돌려받는다
+          if (!mountedRef.current) return;
           applyWalk(walk);
+          setConfirmed(stopped); // 정리 실패면 확인 대기 상태로 두고 하트비트가 재시도한다
           setIsTracking(true);
         } else if (walk && running && walk.endedAt !== undefined) {
           // 종료 시각이 이미 기록된 산책인데 서비스가 남아 있으면 계속 수집하지 않고 저장/버리기로 보낸다.
@@ -236,7 +260,7 @@ export default function useLocation() {
       mountedRef.current = false;
       unsubscribe();
     };
-  }, [applyWalk, runExclusive]);
+  }, [applyWalk, runExclusive, setConfirmed]);
 
   const startTracking = useCallback(
     () =>
@@ -296,8 +320,9 @@ export default function useLocation() {
     [applyWalk, runExclusive]
   );
 
-  // 일시정지: 일시정지 시각을 메타에 먼저 영속화한 뒤 서비스를 멈춘다. 시작·종료·복원·재개와 같은 직렬 큐에서만 실행되고,
-  // 산책 중이 아니거나 이미 일시정지 중이거나 중단 전환(lostPending) 중이면 아무것도 바꾸지 않는다.
+  // 일시정지: 일시정지 시각을 메타에 먼저 영속화한 뒤 서비스를 멈추고 중단을 확인한다. 시작·종료·복원·재개와 같은 직렬
+  // 큐에서만 실행되고, 산책 중이 아니거나 이미 일시정지 중이거나 중단 전환(lostPending) 중이면 아무것도 바꾸지 않는다.
+  // 요청(pausedAt)과 중단 확인(confirmed)을 구분한다: 확인 전에는 pausePending으로 표시하고 하트비트가 재시도한다.
   const pauseTracking = useCallback(
     (at) =>
       runExclusive(async () => {
@@ -307,20 +332,23 @@ export default function useLocation() {
         const result = await pauseCollection({
           walkId: walkIdRef.current,
           at,
-          isServiceRunning: () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME),
+          isServiceRunning,
           stopService: stopAndVerify,
         });
-        if (result.ok && mountedRef.current) {
+        if (!mountedRef.current) return result;
+        if (result.ok || result.reason === 'rollback-failed') {
+          // 메타에 pausedAt이 남아 있다(롤백 실패 포함): 화면을 메타에 맞춰 일시정지 대기/완료로 동기화한다.
           pausedRef.current = true;
+          setConfirmed(result.ok ? result.confirmed : false);
           setPausedAt(result.pausedAt);
         }
         return result;
       }),
-    [runExclusive]
+    [runExclusive, setConfirmed]
   );
 
   // 다시 시작: 권한을 확인하고, 같은 산책 id로 서비스를 다시 띄운 뒤 일시정지 구간을 메타에 옮긴다.
-  // 실패하면 일시정지 상태를 그대로 둔다(재시도 가능).
+  // 실패하면 일시정지 상태를 그대로 두고(재시도 가능), 롤백 중단이 확인되지 않으면 확인 대기로 둔다.
   const resumeTracking = useCallback(
     (at) =>
       runExclusive(async () => {
@@ -338,17 +366,22 @@ export default function useLocation() {
         const result = await resumeCollection({
           walkId: walkIdRef.current,
           at,
+          isServiceRunning,
           startService: restartService,
-          stopService: cleanupService,
+          stopService: stopAndVerify,
         });
-        if (result.ok && mountedRef.current) {
+        if (!mountedRef.current) return result;
+        if (result.ok) {
           pausedRef.current = false;
+          setConfirmed(true);
           setPauses(result.pauses);
           setPausedAt(null);
+        } else if (result.stopStatus && result.stopStatus !== 'stopped') {
+          setConfirmed(false); // 롤백 중단을 확인하지 못함 → 하트비트가 같은 산책 id로 재시도
         }
         return result;
       }),
-    [runExclusive]
+    [runExclusive, setConfirmed]
   );
 
   // 수집 중단을 확인한 뒤 임시 기록을 읽어 반환한다. 어느 단계든 실패하면 isTracking과 임시 기록을
@@ -372,11 +405,12 @@ export default function useLocation() {
         if (stoppedOrUnknown && mountedRef.current) {
           setIsTracking(false);
           pausedRef.current = false;
+          setConfirmed(true);
           setPausedAt(null);
         }
         return result;
       }),
-    [runExclusive]
+    [runExclusive, setConfirmed]
   );
 
   // 하트비트(HomeScreen이 주기적으로 호출): 서비스 실행·foreground 권한을 확인한 뒤에만 lastAliveAt을 쓴다.
@@ -391,10 +425,32 @@ export default function useLocation() {
     setLostPending(false);
   }, []);
 
+  // 일시정지 확인 대기 중 한 번 재시도: 같은 산책 id에만 작용한다(retryPauseStop이 메타 id·pausedAt을 다시 확인).
+  // 반환: 'paused'(확인 완료) | 'paused-pending'(계속 대기) | 'skipped'
+  const retryPauseConfirm = useCallback(
+    () =>
+      runExclusive(async () => {
+        if (!mountedRef.current || !pausedRef.current || pauseConfirmedRef.current) return 'paused';
+        const result = await retryPauseStop({
+          walkId: walkIdRef.current ?? undefined,
+          isServiceRunning,
+          stopService: stopAndVerify,
+        });
+        if (!mountedRef.current) return 'skipped';
+        if (result.status === 'pending') return 'paused-pending';
+        setConfirmed(true); // 'stopped'(확인 완료) 또는 'stale'(다른 상태로 바뀜: 더는 이 산책에 작용하지 않는다)
+        return 'paused';
+      }),
+    [runExclusive, setConfirmed]
+  );
+
   const heartbeat = useCallback(
     async ({ transition = true } = {}) => {
       if (opPendingRef.current > 0 || !mountedRef.current) return 'skipped';
-      if (pausedRef.current) return 'paused'; // 일시정지 중: 서비스가 꺼져 있는 것이 정상(lost로 판정하지 않는다)
+      if (pausedRef.current) {
+        // 일시정지 중: 서비스가 꺼져 있는 것이 정상(lost로 판정하지 않는다). 중단 확인 전이면 재조회·중단을 재시도한다.
+        return pauseConfirmedRef.current ? 'paused' : retryPauseConfirm();
+      }
       const probes = {
         isServiceRunning: () => Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME),
         hasPermission: async () => (await Location.getForegroundPermissionsAsync()).status === 'granted',
@@ -406,7 +462,7 @@ export default function useLocation() {
       }
       return runExclusive(async () => {
         if (!mountedRef.current) return 'skipped';
-        if (pausedRef.current) return 'paused'; // 대기하는 동안 일시정지됐을 수 있다
+        if (pausedRef.current) return pauseConfirmedRef.current ? 'paused' : 'paused-pending'; // 대기 중 일시정지됐을 수 있다
         const result = await heartbeatStep({
           lostPending: lostPendingRef.current,
           lostWalkId: lostWalkIdRef.current ?? undefined,
@@ -433,7 +489,7 @@ export default function useLocation() {
         return 'lost';
       });
     },
-    [runExclusive, clearLostPending]
+    [runExclusive, clearLostPending, retryPauseConfirm]
   );
 
   const resetTracking = useCallback(() => {
@@ -441,12 +497,13 @@ export default function useLocation() {
     clearLostPending();
     walkIdRef.current = null;
     pausedRef.current = false;
+    setConfirmed(true);
     setCoords([]);
     setStartedAt(null);
     setPausedAt(null);
     setPauses([]);
     setInterruptedWalk(null);
-  }, [clearLostPending]);
+  }, [clearLostPending, setConfirmed]);
 
   // 일시정지 경계(끝난 구간 + 진행 중인 일시정지)로 나눈 구간별 유효 샘플. 구간 사이는 잇지 않는다.
   const segments = useMemo(
@@ -472,6 +529,7 @@ export default function useLocation() {
     acquiring,
     isTracking,
     isPaused,
+    pausePending: isPaused && !pauseConfirmed,
     pausedAt,
     pauses,
     startedAt,

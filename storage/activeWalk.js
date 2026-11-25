@@ -173,7 +173,9 @@ export function markActiveWalkResumed(id, at) {
       ...(Array.isArray(meta.pauses) ? meta.pauses : []),
       { start: pausedAt, end: Math.max(at, pausedAt) },
     ];
-    await AsyncStorage.setItem(META_KEY, JSON.stringify({ ...rest, pauses }));
+    // 재개 시각을 "마지막으로 살아 있던 시각"으로도 남긴다(재개 직후 새 샘플·하트비트 전에 중단돼도 추정 종료가 되돌아가지 않게).
+    const lastAliveAt = Math.max(typeof meta.lastAliveAt === 'number' ? meta.lastAliveAt : 0, at);
+    await AsyncStorage.setItem(META_KEY, JSON.stringify({ ...rest, pauses, lastAliveAt }));
     return { pauses };
   });
 }
@@ -320,13 +322,50 @@ export async function heartbeatStep({
   }
 }
 
+// 서비스를 멈추고 "멈췄음"을 확인한다. 상태 조회가 예외여도 중단은 시도한다(조회 오류를 "멈춤"으로도 "실행 중"으로도
+// 단정하지 않는다). 반환: { status: 'stopped' }(확인된 중단) | { status: 'running', message }(실행 중임을 확인)
+//   | { status: 'unknown', message }(중단 후에도 상태를 조회하지 못함). 호출자는 'stopped'가 아니면 같은 산책 id에 묶어 재시도한다.
+export async function ensureServiceStopped({ isServiceRunning, stopService }) {
+  let running = false;
+  let queryError = null;
+  try {
+    running = Boolean(await isServiceRunning());
+  } catch (e) {
+    queryError = e;
+  }
+  if (!queryError && !running) return { status: 'stopped' };
+  let stopError = null;
+  try {
+    await stopService();
+  } catch (e) {
+    stopError = e;
+  }
+  try {
+    running = Boolean(await isServiceRunning());
+    queryError = null;
+  } catch (e) {
+    queryError = e;
+  }
+  if (queryError) {
+    return { status: 'unknown', message: queryError?.message ?? stopError?.message ?? String(queryError) };
+  }
+  if (running) {
+    return { status: 'running', message: stopError?.message ?? '위치 수집이 중단되지 않았습니다.' };
+  }
+  return { status: 'stopped' };
+}
+
 // 일시정지 시퀀스(서비스 중단 + 메타 영속화). 서비스 제어는 주입받는다(finishCollection과 같은 규율).
-// 1) 일시정지 시작 시각을 메타에 먼저 영속화 → 2) 서비스 상태 확인·중단. 조회 오류를 "중단됨/계속 실행"으로 단정하지 않는다.
-// 반환: { ok: true, pausedAt, unconfirmed }   unconfirmed=true: 중단 여부를 확인하지 못함(시각은 보존, 이후 재개·종료·복원이
-//                                              서비스를 정리한다)
-//   | { ok: false, reason: 'invalid' }          진행 중 산책이 없거나 이미 종료 시각이 있음(아무것도 바꾸지 않음)
+// 1) 일시정지 시작 시각을 메타에 먼저 영속화 → 2) 중단을 시도·확인(ensureServiceStopped, 조회 예외여도 stop 시도).
+// "일시정지 요청"(메타의 pausedAt)과 "중단 확인 완료"(confirmed)는 다르다.
+// 반환: { ok: true, pausedAt, confirmed }
+//        confirmed=true: 중단 확인 완료. confirmed=false: 확인 대기(조회 실패, 또는 이미 일시정지 중인데 계속 실행 중) →
+//        호출자는 같은 산책 id로 retryPauseStop을 하트비트마다 반복한다.
+//   | { ok: false, reason: 'invalid' }           진행 중 산책이 없거나 이미 종료 시각이 있음(아무것도 바꾸지 않음)
 //   | { ok: false, reason: 'pause-failed', message }  메타 쓰기 실패(서비스는 그대로)
-//   | { ok: false, reason: 'stop-failed', message }   서비스가 계속 실행 중임을 확인(이번에 새로 쓴 일시정지만 지움)
+//   | { ok: false, reason: 'stop-failed', message }   서비스가 계속 실행 중임을 확인했고 일시정지 요청 롤백도 성공(수집 지속)
+//   | { ok: false, reason: 'rollback-failed', pausedAt, message }  계속 실행 중이고 롤백 쓰기도 실패: 메타에 pausedAt이
+//        남아 있으므로 호출자는 일시정지 확인 대기 상태로 맞추고 retryPauseStop으로 정리한다.
 export async function pauseCollection({ walkId, at, isServiceRunning, stopService }) {
   let marked;
   try {
@@ -336,37 +375,26 @@ export async function pauseCollection({ walkId, at, isServiceRunning, stopServic
   }
   if (!marked) return { ok: false, reason: 'invalid' };
   const { pausedAt, created } = marked;
-  const unconfirmed = () => ({ ok: true, pausedAt, unconfirmed: true });
 
-  let running;
+  const stopped = await ensureServiceStopped({ isServiceRunning, stopService });
+  if (stopped.status === 'stopped') return { ok: true, pausedAt, confirmed: true };
+  if (stopped.status === 'unknown' || !created) {
+    // 상태를 확인하지 못했거나, 이미 일시정지 요청이 있던 산책이 계속 실행 중: 요청은 유지하고 확인 대기로 둔다.
+    return { ok: true, pausedAt, confirmed: false };
+  }
+  // 이번에 새로 쓴 일시정지 요청이고 서비스가 계속 실행 중임을 확인 → 요청을 되돌려 수집 지속 상태로 복귀
   try {
-    running = await isServiceRunning();
-  } catch {
-    return unconfirmed();
+    await clearActiveWalkPaused(walkId, pausedAt);
+  } catch (clearError) {
+    console.warn('[activeWalk] clear pausedAt failed', clearError?.message ?? clearError);
+    return {
+      ok: false,
+      reason: 'rollback-failed',
+      pausedAt,
+      message: clearError?.message ?? stopped.message,
+    };
   }
-  if (running) {
-    try {
-      await stopService();
-    } catch (stopError) {
-      let stillRunning;
-      try {
-        stillRunning = await isServiceRunning();
-      } catch {
-        return unconfirmed();
-      }
-      if (stillRunning) {
-        if (created) {
-          try {
-            await clearActiveWalkPaused(walkId, pausedAt);
-          } catch (clearError) {
-            console.warn('[activeWalk] clear pausedAt failed', clearError?.message ?? clearError);
-          }
-        }
-        return { ok: false, reason: 'stop-failed', message: stopError?.message ?? String(stopError) };
-      }
-    }
-  }
-  return { ok: true, pausedAt, unconfirmed: false };
+  return { ok: false, reason: 'stop-failed', message: stopped.message };
 }
 
 // 일시정지 상태 확인(메타만). 반환: { pausedAt?, endedAt? } | null(메타 없음·id 다름).
@@ -381,24 +409,46 @@ export function peekActiveWalkState(id) {
   });
 }
 
-// 다시 시작 시퀀스: 일시정지 중인 같은 산책(id)에서만 → 1) 서비스 시작 → 2) 일시정지를 메타의 pauses로 옮김.
-// 서비스를 먼저 띄우므로 메타 갱신이 실패하면 서비스를 되돌려(stopService, 실패는 경고) 일시정지 상태를 유지한다.
-// 반환: { ok: true, pauses } | { ok: false, reason: 'invalid' }(일시정지 중이 아님·종료됨, 서비스 시작 안 함)
-//   | { ok: false, reason: 'start-failed' | 'resume-failed', message }  (일시정지 상태 유지)
-export async function resumeCollection({ walkId, at, startService, stopService }) {
+// 일시정지 확인 대기 상태의 한 번 재시도(하트비트 주기마다 호출, 사용자 입력 불필요).
+// 같은 산책 id의 메타에 pausedAt이 남아 있고 종료되지 않았을 때만 중단을 다시 확인·시도한다(새 산책에는 작용하지 않는다).
+// 반환: { status: 'stopped' }(확인 완료) | { status: 'pending', message? }(계속 대기) | { status: 'stale' }
+//   (메타가 없거나 id가 다르거나 일시정지/종료 상태가 바뀜 → 재시도 중단, 서비스는 건드리지 않음)
+export async function retryPauseStop({ walkId, isServiceRunning, stopService }) {
   let state;
   try {
     state = await peekActiveWalkState(walkId);
   } catch (e) {
-    return { ok: false, reason: 'resume-failed', message: e?.message ?? String(e) };
+    return { status: 'pending', message: e?.message ?? String(e) };
+  }
+  if (!state || state.pausedAt === undefined || state.endedAt !== undefined) return { status: 'stale' };
+  const r = await ensureServiceStopped({ isServiceRunning, stopService });
+  return r.status === 'stopped' ? { status: 'stopped' } : { status: 'pending', message: r.message };
+}
+
+// 다시 시작 시퀀스: 일시정지 중인 같은 산책(id)에서만 → 1) 서비스 시작 → 2) 일시정지를 메타의 pauses로 옮김(lastAliveAt 갱신).
+// 서비스를 먼저 띄우므로 시작·메타 갱신이 실패하면 서비스를 되돌린다(ensureServiceStopped, 조회 예외여도 stop 시도).
+// 반환: { ok: true, pauses } | { ok: false, reason: 'invalid' }(일시정지 중이 아님·종료됨, 서비스 시작 안 함)
+//   | { ok: false, reason: 'start-failed' | 'resume-failed', message, stopStatus }  일시정지 상태 유지.
+//     stopStatus: 롤백 중단 결과('stopped' | 'running' | 'unknown'). 'stopped'가 아니면 호출자는 확인 대기로 두고 재시도한다.
+export async function resumeCollection({ walkId, at, startService, stopService, isServiceRunning }) {
+  let state;
+  try {
+    state = await peekActiveWalkState(walkId);
+  } catch (e) {
+    return { ok: false, reason: 'resume-failed', message: e?.message ?? String(e), stopStatus: 'stopped' };
   }
   if (!state || state.pausedAt === undefined || state.endedAt !== undefined) {
     return { ok: false, reason: 'invalid' };
   }
+  const rollback = async () => {
+    const r = await ensureServiceStopped({ isServiceRunning, stopService });
+    if (r.status !== 'stopped') console.warn('[activeWalk] stop after failed resume not confirmed', r.status);
+    return r.status;
+  };
   try {
     await startService();
   } catch (e) {
-    return { ok: false, reason: 'start-failed', message: e?.message ?? String(e) };
+    return { ok: false, reason: 'start-failed', message: e?.message ?? String(e), stopStatus: await rollback() };
   }
   let resumed = null;
   let failure = null;
@@ -408,14 +458,10 @@ export async function resumeCollection({ walkId, at, startService, stopService }
     failure = e;
   }
   if (resumed) return { ok: true, pauses: resumed.pauses };
-  try {
-    await stopService();
-  } catch (e) {
-    console.warn('[activeWalk] stop after failed resume failed', e?.message ?? e);
-  }
+  const stopStatus = await rollback();
   return failure
-    ? { ok: false, reason: 'resume-failed', message: failure?.message ?? String(failure) }
-    : { ok: false, reason: 'invalid' };
+    ? { ok: false, reason: 'resume-failed', message: failure?.message ?? String(failure), stopStatus }
+    : { ok: false, reason: 'invalid', stopStatus };
 }
 
 // 서비스를 끝내 멈추지 못했을 때 영속화한 종료 시각을 지운다(수집이 계속되는 산책으로 되돌린다). 메타 전용.
